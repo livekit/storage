@@ -25,51 +25,57 @@ import (
 )
 
 type azureBLOBStorage struct {
-	conf      *AzureConfig
-	container string
+	conf         *AzureConfig
+	container    string
+	containerUrl azblob.ContainerURL
 }
 
 func NewAzure(conf *AzureConfig) (Storage, error) {
-	return &azureBLOBStorage{
-		conf:      conf,
-		container: fmt.Sprintf("https://%s.blob.core.windows.net/%s", conf.AccountName, conf.ContainerName),
-	}, nil
-}
-
-func (s *azureBLOBStorage) UploadData(data []byte, storagePath, contentType string) (string, int64, error) {
-	// TODO implement me
-	panic("implement me")
-}
-
-func (s *azureBLOBStorage) UploadFile(filepath, storagePath, contentType string) (string, int64, error) {
-	return s.upload(filepath, storagePath, contentType)
-}
-
-func (s *azureBLOBStorage) upload(filepath, storagePath, contentType string) (string, int64, error) {
 	credential, err := azblob.NewSharedKeyCredential(
-		s.conf.AccountName,
-		s.conf.AccountKey,
+		conf.AccountName,
+		conf.AccountKey,
 	)
 	if err != nil {
-		return "", 0, err
-	}
-
-	azUrl, err := url.Parse(s.container)
-	if err != nil {
-		return "", 0, err
+		return nil, err
 	}
 
 	pipeline := azblob.NewPipeline(credential, azblob.PipelineOptions{
 		Retry: azblob.RetryOptions{
 			Policy:        azblob.RetryPolicyExponential,
 			MaxTries:      5,
-			RetryDelay:    time.Millisecond * 100,
 			MaxRetryDelay: time.Second * 5,
 		},
 	})
-	containerURL := azblob.NewContainerURL(*azUrl, pipeline)
-	blobURL := containerURL.NewBlockBlobURL(storagePath)
+	sUrl := fmt.Sprintf("https://%s.blob.core.windows.net/%s", conf.AccountName, conf.ContainerName)
+	azUrl, err := url.Parse(sUrl)
+	if err != nil {
+		return nil, err
+	}
 
+	containerUrl := azblob.NewContainerURL(*azUrl, pipeline)
+
+	return &azureBLOBStorage{
+		conf:         conf,
+		container:    sUrl,
+		containerUrl: containerUrl,
+	}, nil
+}
+
+func (s *azureBLOBStorage) UploadData(data []byte, storagePath, contentType string) (string, int64, error) {
+	blobUrl := s.containerUrl.NewBlockBlobURL(storagePath)
+	_, err := azblob.UploadBufferToBlockBlob(context.Background(), data, blobUrl, azblob.UploadToBlockBlobOptions{
+		BlobHTTPHeaders: azblob.BlobHTTPHeaders{ContentType: contentType},
+		BlockSize:       4 * 1024 * 1024,
+		Parallelism:     16,
+	})
+	if err != nil {
+		return "", 0, err
+	}
+
+	return fmt.Sprintf("%s/%s", s.container, storagePath), int64(len(data)), nil
+}
+
+func (s *azureBLOBStorage) UploadFile(filepath, storagePath, contentType string) (string, int64, error) {
 	file, err := os.Open(filepath)
 	if err != nil {
 		return "", 0, err
@@ -85,7 +91,8 @@ func (s *azureBLOBStorage) upload(filepath, storagePath, contentType string) (st
 
 	// upload blocks in parallel for optimal performance
 	// it calls PutBlock/PutBlockList for files larger than 256 MBs and PutBlob for smaller files
-	_, err = azblob.UploadFileToBlockBlob(context.Background(), file, blobURL, azblob.UploadToBlockBlobOptions{
+	blobUrl := s.containerUrl.NewBlockBlobURL(storagePath)
+	_, err = azblob.UploadFileToBlockBlob(context.Background(), file, blobUrl, azblob.UploadToBlockBlobOptions{
 		BlobHTTPHeaders: azblob.BlobHTTPHeaders{ContentType: contentType},
 		BlockSize:       4 * 1024 * 1024,
 		Parallelism:     16,
@@ -98,62 +105,47 @@ func (s *azureBLOBStorage) upload(filepath, storagePath, contentType string) (st
 }
 
 func (s *azureBLOBStorage) DownloadData(storagePath string) ([]byte, error) {
-	// TODO implement me
-	panic("implement me")
-}
+	b := make([]byte, 0)
 
-func (s *azureBLOBStorage) DownloadFile(filepath, storagePath string) (int64, error) {
-	err := s.download(filepath, storagePath)
-	if err != nil {
-		return 0, err
-	}
-
-	stat, err := os.Stat(filepath)
-	if err != nil {
-		return 0, err
-	}
-
-	return stat.Size(), nil
-}
-
-func (s *azureBLOBStorage) download(filepath, storagePath string) error {
-	credential, err := azblob.NewSharedKeyCredential(
-		s.conf.AccountName,
-		s.conf.AccountKey,
-	)
-	if err != nil {
-		return err
-	}
-
-	pipeline := azblob.NewPipeline(credential, azblob.PipelineOptions{
-		Retry: azblob.RetryOptions{
-			Policy:        azblob.RetryPolicyExponential,
-			MaxTries:      5,
-			MaxRetryDelay: time.Second * 5,
-		},
-	})
-	sUrl := fmt.Sprintf("https://%s.blob.core.windows.net/%s", s.conf.AccountName, s.conf.ContainerName)
-	azUrl, err := url.Parse(sUrl)
-	if err != nil {
-		return err
-	}
-
-	containerURL := azblob.NewContainerURL(*azUrl, pipeline)
-	blobURL := containerURL.NewBlobURL(storagePath)
-
-	file, err := os.Create(filepath)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-
-	return azblob.DownloadBlobToFile(context.Background(), blobURL, 0, 0, file, azblob.DownloadFromBlobOptions{
+	blobUrl := s.containerUrl.NewBlobURL(storagePath)
+	err := azblob.DownloadBlobToBuffer(context.Background(), blobUrl, 0, azblob.CountToEnd, b, azblob.DownloadFromBlobOptions{
 		BlockSize:   4 * 1024 * 1024,
 		Parallelism: 16,
 		RetryReaderOptionsPerBlock: azblob.RetryReaderOptions{
 			MaxRetryRequests: 3,
 		},
 	})
+	if err != nil {
+		return nil, err
+	}
+
+	return b, nil
+}
+
+func (s *azureBLOBStorage) DownloadFile(filepath, storagePath string) (int64, error) {
+	file, err := os.Create(filepath)
+	if err != nil {
+		return 0, err
+	}
+	defer file.Close()
+
+	blobUrl := s.containerUrl.NewBlobURL(storagePath)
+	err = azblob.DownloadBlobToFile(context.Background(), blobUrl, 0, 0, file, azblob.DownloadFromBlobOptions{
+		BlockSize:   4 * 1024 * 1024,
+		Parallelism: 16,
+		RetryReaderOptionsPerBlock: azblob.RetryReaderOptions{
+			MaxRetryRequests: 3,
+		},
+	})
+	if err != nil {
+		return 0, err
+	}
+
+	stat, err := file.Stat()
+	if err != nil {
+		return 0, err
+	}
+	return stat.Size(), nil
 }
 
 func (s *azureBLOBStorage) GeneratePresignedUrl(storagePath string) (string, error) {
@@ -162,29 +154,7 @@ func (s *azureBLOBStorage) GeneratePresignedUrl(storagePath string) (string, err
 }
 
 func (s *azureBLOBStorage) Delete(storagePath string) error {
-	credential, err := azblob.NewSharedKeyCredential(
-		s.conf.AccountName,
-		s.conf.AccountKey,
-	)
-	if err != nil {
-		return err
-	}
-
-	pipeline := azblob.NewPipeline(credential, azblob.PipelineOptions{
-		Retry: azblob.RetryOptions{
-			Policy:        azblob.RetryPolicyExponential,
-			MaxTries:      5,
-			MaxRetryDelay: time.Second * 5,
-		},
-	})
-	sUrl := fmt.Sprintf("https://%s.blob.core.windows.net/%s", s.conf.AccountName, s.conf.ContainerName)
-	azUrl, err := url.Parse(sUrl)
-	if err != nil {
-		return err
-	}
-
-	containerURL := azblob.NewContainerURL(*azUrl, pipeline)
-	blobURL := containerURL.NewBlobURL(storagePath)
-	_, err = blobURL.Delete(context.Background(), azblob.DeleteSnapshotsOptionNone, azblob.BlobAccessConditions{})
+	blobUrl := s.containerUrl.NewBlobURL(storagePath)
+	_, err := blobUrl.Delete(context.Background(), azblob.DeleteSnapshotsOptionNone, azblob.BlobAccessConditions{})
 	return err
 }

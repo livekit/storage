@@ -23,23 +23,30 @@ import (
 )
 
 type aliOSSStorage struct {
-	conf *AliOSSConfig
+	conf   *AliOSSConfig
+	bucket *oss.Bucket
 }
 
 func NewAliOSS(conf *AliOSSConfig) (Storage, error) {
+	client, err := oss.New(conf.Endpoint, conf.AccessKey, conf.Secret)
+	if err != nil {
+		return nil, err
+	}
+
+	bucket, err := client.Bucket(conf.Bucket)
+	if err != nil {
+		return nil, err
+	}
+
 	return &aliOSSStorage{
-		conf: conf,
+		conf:   conf,
+		bucket: bucket,
 	}, nil
 }
 
 func (s *aliOSSStorage) UploadData(data []byte, storagePath, _ string) (location string, size int64, err error) {
-	bucket, err := s.getBucket()
-	if err != nil {
-		return "", 0, err
-	}
-
 	reader := bytes.NewBuffer(data)
-	if err = bucket.PutObject(storagePath, reader); err != nil {
+	if err = s.bucket.PutObject(storagePath, reader); err != nil {
 		return "", 0, err
 	}
 
@@ -52,25 +59,11 @@ func (s *aliOSSStorage) UploadFile(filepath, storagePath, _ string) (location st
 		return "", 0, err
 	}
 
-	bucket, err := s.getBucket()
-	if err != nil {
-		return "", 0, err
-	}
-
-	if err = bucket.PutObjectFromFile(storagePath, filepath); err != nil {
+	if err = s.bucket.PutObjectFromFile(storagePath, filepath); err != nil {
 		return "", 0, err
 	}
 
 	return fmt.Sprintf("https://%s.%s/%s", s.conf.Bucket, s.conf.Endpoint, storagePath), stat.Size(), nil
-}
-
-func (s *aliOSSStorage) getBucket() (*oss.Bucket, error) {
-	client, err := oss.New(s.conf.Endpoint, s.conf.AccessKey, s.conf.Secret)
-	if err != nil {
-		return nil, err
-	}
-
-	return client.Bucket(s.conf.Bucket)
 }
 
 func (s *aliOSSStorage) DownloadData(storagePath string) (data []byte, err error) {

@@ -15,6 +15,7 @@
 package storage
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"fmt"
@@ -80,28 +81,20 @@ func NewGCP(conf *GCPConfig) (Storage, error) {
 }
 
 func (s *gcpStorage) UploadData(data []byte, storagePath, contentType string) (string, int64, error) {
-	// TODO implement me
-	panic("implement me")
+	return s.upload(bytes.NewReader(data), storagePath, contentType)
 }
 
 func (s *gcpStorage) UploadFile(filepath, storagePath, contentType string) (string, int64, error) {
-	return s.upload(filepath, storagePath, contentType)
-}
-
-func (s *gcpStorage) upload(filepath, storagePath, _ string) (string, int64, error) {
 	file, err := os.Open(filepath)
 	if err != nil {
 		return "", 0, err
 	}
-	defer func() {
-		_ = file.Close()
-	}()
+	defer file.Close()
 
-	stat, err := file.Stat()
-	if err != nil {
-		return "", 0, err
-	}
+	return s.upload(file, storagePath, contentType)
+}
 
+func (s *gcpStorage) upload(reader io.Reader, storagePath, _ string) (string, int64, error) {
 	wc := s.client.Bucket(s.conf.Bucket).Object(storagePath).Retryer(
 		storage.WithBackoff(gax.Backoff{
 			Initial:    time.Millisecond * 100,
@@ -113,7 +106,8 @@ func (s *gcpStorage) upload(filepath, storagePath, _ string) (string, int64, err
 	).NewWriter(context.Background())
 	wc.ChunkRetryDeadline = 0
 
-	if _, err = io.Copy(wc, file); err != nil {
+	n, err := io.Copy(wc, reader)
+	if err != nil {
 		return "", 0, err
 	}
 
@@ -121,12 +115,21 @@ func (s *gcpStorage) upload(filepath, storagePath, _ string) (string, int64, err
 		return "", 0, err
 	}
 
-	return fmt.Sprintf("https://%s.storage.googleapis.com/%s", s.conf.Bucket, storagePath), stat.Size(), nil
+	return fmt.Sprintf("https://%s.storage.googleapis.com/%s", s.conf.Bucket, storagePath), n, nil
 }
 
 func (s *gcpStorage) DownloadData(storagePath string) ([]byte, error) {
-	// TODO implement me
-	panic("implement me")
+	rc, err := s.download(storagePath)
+	if err != nil {
+		return nil, err
+	}
+
+	b := make([]byte, rc.Attrs.Size)
+	_, err = rc.Read(b)
+	if err != nil {
+		return nil, err
+	}
+	return b, nil
 }
 
 func (s *gcpStorage) DownloadFile(filepath, storagePath string) (int64, error) {
@@ -174,7 +177,6 @@ func (s *gcpStorage) download(storagePath string) (*storage.Reader, error) {
 			}),
 		storage.WithPolicy(storage.RetryAlways),
 	).NewReader(ctx)
-
 }
 
 func (s *gcpStorage) GeneratePresignedUrl(storagePath string) (string, error) {
