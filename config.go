@@ -14,7 +14,11 @@
 
 package storage
 
-import "time"
+import (
+	"time"
+
+	"github.com/Azure/azure-storage-blob-go/azblob"
+)
 
 type S3Config struct {
 	AccessKey      string       `yaml:"access_key"`
@@ -36,9 +40,10 @@ type S3Config struct {
 }
 
 type AzureConfig struct {
-	AccountName   string `yaml:"account_name"` // (env AZURE_STORAGE_ACCOUNT)
-	AccountKey    string `yaml:"account_key"`  // (env AZURE_STORAGE_KEY)
-	ContainerName string `yaml:"container_name"`
+	AccountName     string                 `yaml:"account_name"` // (env AZURE_STORAGE_ACCOUNT)
+	AccountKey      string                 `yaml:"account_key"`  // (env AZURE_STORAGE_KEY)
+	ContainerName   string                 `yaml:"container_name"`
+	TokenCredential azblob.TokenCredential `yaml:"-"` // required for presigned url generation
 }
 
 type GCPConfig struct {

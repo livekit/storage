@@ -17,6 +17,7 @@ package storage
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"os"
 
 	"github.com/aliyun/aliyun-oss-go-sdk/oss"
@@ -44,17 +45,17 @@ func NewAliOSS(conf *AliOSSConfig) (Storage, error) {
 	}, nil
 }
 
-func (s *aliOSSStorage) UploadData(data []byte, storagePath, _ string) (location string, size int64, err error) {
+func (s *aliOSSStorage) UploadData(data []byte, storagePath, _ string) (string, int64, error) {
 	reader := bytes.NewBuffer(data)
-	if err = s.bucket.PutObject(storagePath, reader); err != nil {
+	if err := s.bucket.PutObject(storagePath, reader); err != nil {
 		return "", 0, err
 	}
 
 	return fmt.Sprintf("https://%s.%s/%s", s.conf.Bucket, s.conf.Endpoint, storagePath), int64(len(data)), nil
 }
 
-func (s *aliOSSStorage) UploadFile(filepath, storagePath, _ string) (location string, size int64, err error) {
-	stat, err := os.Stat(filepath)
+func (s *aliOSSStorage) UploadFile(filepath, storagePath, _ string) (string, int64, error) {
+	info, err := os.Stat(filepath)
 	if err != nil {
 		return "", 0, err
 	}
@@ -63,25 +64,36 @@ func (s *aliOSSStorage) UploadFile(filepath, storagePath, _ string) (location st
 		return "", 0, err
 	}
 
-	return fmt.Sprintf("https://%s.%s/%s", s.conf.Bucket, s.conf.Endpoint, storagePath), stat.Size(), nil
+	return fmt.Sprintf("https://%s.%s/%s", s.conf.Bucket, s.conf.Endpoint, storagePath), info.Size(), nil
 }
 
-func (s *aliOSSStorage) DownloadData(storagePath string) (data []byte, err error) {
-	// TODO implement me
-	panic("implement me")
+func (s *aliOSSStorage) DownloadData(storagePath string) ([]byte, error) {
+	reader, err := s.bucket.GetObject(storagePath)
+	if err != nil {
+		return nil, err
+	}
+	defer reader.Close()
+
+	return io.ReadAll(reader)
 }
 
-func (s *aliOSSStorage) DownloadFile(filepath, storagePath string) (size int64, err error) {
-	// TODO implement me
-	panic("implement me")
+func (s *aliOSSStorage) DownloadFile(filepath, storagePath string) (int64, error) {
+	if err := s.bucket.GetObjectToFile(storagePath, filepath); err != nil {
+		return 0, err
+	}
+
+	info, err := os.Stat(filepath)
+	if err != nil {
+		return 0, err
+	}
+
+	return info.Size(), nil
 }
 
-func (s *aliOSSStorage) GeneratePresignedUrl(storagePath string) (url string, err error) {
-	// TODO implement me
-	panic("implement me")
+func (s *aliOSSStorage) GeneratePresignedUrl(storagePath string) (string, error) {
+	return s.bucket.SignURL(storagePath, oss.HTTPGet, 7*24*60*60)
 }
 
 func (s *aliOSSStorage) Delete(storagePath string) error {
-	// TODO implement me
-	panic("implement me")
+	return s.bucket.DeleteObject(storagePath)
 }
