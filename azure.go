@@ -16,9 +16,11 @@ package storage
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
+	"path"
 	"time"
 
 	"github.com/Azure/azure-storage-blob-go/azblob"
@@ -28,6 +30,7 @@ type azureBLOBStorage struct {
 	conf         *AzureConfig
 	container    string
 	containerUrl azblob.ContainerURL
+	serviceUrl   azblob.ServiceURL
 }
 
 func NewAzure(conf *AzureConfig) (Storage, error) {
@@ -46,18 +49,24 @@ func NewAzure(conf *AzureConfig) (Storage, error) {
 			MaxRetryDelay: time.Second * 5,
 		},
 	})
-	sUrl := fmt.Sprintf("https://%s.blob.core.windows.net/%s", conf.AccountName, conf.ContainerName)
-	azUrl, err := url.Parse(sUrl)
+
+	sUrl := fmt.Sprintf("https://%s.blob.core.windows.net", conf.AccountName)
+	serviceUrl, err := url.Parse(sUrl)
 	if err != nil {
 		return nil, err
 	}
 
-	containerUrl := azblob.NewContainerURL(*azUrl, pipeline)
+	cUrl := path.Join(sUrl, conf.ContainerName)
+	containerUrl, err := url.Parse(cUrl)
+	if err != nil {
+		return nil, err
+	}
 
 	return &azureBLOBStorage{
 		conf:         conf,
 		container:    sUrl,
-		containerUrl: containerUrl,
+		serviceUrl:   azblob.NewServiceURL(*serviceUrl, pipeline),
+		containerUrl: azblob.NewContainerURL(*containerUrl, pipeline),
 	}, nil
 }
 
@@ -149,8 +158,34 @@ func (s *azureBLOBStorage) DownloadFile(filepath, storagePath string) (int64, er
 }
 
 func (s *azureBLOBStorage) GeneratePresignedUrl(storagePath string) (string, error) {
-	// TODO implement me
-	panic("implement me")
+	if s.conf.TokenCredential == nil {
+		return "", errors.New("OAuth required")
+	}
+
+	now := time.Now()
+	exp := now.Add(time.Hour * 24 * 7)
+
+	serviceUrl := s.serviceUrl.WithPipeline(azblob.NewPipeline(s.conf.TokenCredential, azblob.PipelineOptions{}))
+	udc, err := serviceUrl.GetUserDelegationCredential(
+		context.Background(), azblob.NewKeyInfo(now, exp), nil, nil,
+	)
+	if err != nil {
+		return "", err
+	}
+
+	qp, err := azblob.BlobSASSignatureValues{
+		Protocol:      azblob.SASProtocolHTTPS,
+		StartTime:     now,
+		ExpiryTime:    exp,
+		Permissions:   azblob.AccountSASPermissions{Read: true}.String(),
+		ContainerName: s.conf.ContainerName,
+		BlobName:      storagePath,
+	}.NewSASQueryParameters(udc)
+	if err != nil {
+		return "", err
+	}
+
+	return fmt.Sprintf("https://%s.blob.core.windows.net?%s", s.conf.AccountName, qp), nil
 }
 
 func (s *azureBLOBStorage) Delete(storagePath string) error {

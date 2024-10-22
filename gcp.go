@@ -180,8 +180,10 @@ func (s *gcpStorage) download(storagePath string) (*storage.Reader, error) {
 }
 
 func (s *gcpStorage) GeneratePresignedUrl(storagePath string) (string, error) {
-	// TODO implement me
-	panic("implement me")
+	return s.client.Bucket(s.conf.Bucket).SignedURL(storagePath, &storage.SignedURLOptions{
+		Method:  "GET",
+		Expires: time.Now().Add(time.Hour * 24 * 7),
+	})
 }
 
 func (s *gcpStorage) Delete(storagePath string) error {
