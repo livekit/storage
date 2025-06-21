@@ -29,41 +29,46 @@ func NewLocal() Storage {
 	return &localUploader{}
 }
 
-func (u *localUploader) UploadFile(filepath, storagePath string, _ string) (string, int64, error) {
-	stat, err := os.Stat(filepath)
-	if err != nil {
-		return "", 0, err
-	}
-
-	dir, _ := path.Split(storagePath)
-	if err = os.MkdirAll(dir, 0755); err != nil {
-		return "", 0, err
-	}
-
-	local, err := os.Open(filepath)
+func (u *localUploader) UploadFile(localPath, storagePath string, _ string) (string, int64, error) {
+	local, err := os.Open(localPath)
 	if err != nil {
 		return "", 0, err
 	}
 	defer local.Close()
 
+	storagePath, err = filepath.Abs(storagePath)
+	if err != nil {
+		return "", 0, err
+	}
+	if dir, _ := path.Split(storagePath); dir != "" {
+		if err = os.MkdirAll(dir, 0755); err != nil {
+			return "", 0, err
+		}
+	}
+
 	storage, err := os.Create(storagePath)
 	if err != nil {
 		return "", 0, err
 	}
 	defer storage.Close()
 
-	_, err = io.Copy(storage, local)
+	size, err := io.Copy(storage, local)
 	if err != nil {
 		return "", 0, err
 	}
 
-	return storagePath, stat.Size(), nil
+	return storagePath, size, nil
 }
 
 func (u *localUploader) UploadData(data []byte, storagePath, _ string) (string, int64, error) {
-	dir, _ := path.Split(storagePath)
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	storagePath, err := filepath.Abs(storagePath)
+	if err != nil {
 		return "", 0, err
+	}
+	if dir, _ := path.Split(storagePath); dir != "" {
+		if err = os.MkdirAll(dir, 0755); err != nil {
+			return "", 0, err
+		}
 	}
 
 	storage, err := os.Create(storagePath)
@@ -72,20 +77,20 @@ func (u *localUploader) UploadData(data []byte, storagePath, _ string) (string, 
 	}
 	defer storage.Close()
 
-	n, err := storage.Write(data)
+	size, err := storage.Write(data)
 	if err != nil {
 		return "", 0, err
 	}
 
-	return storagePath, int64(n), nil
+	return storagePath, int64(size), nil
 }
 
 func (u *localUploader) DownloadData(storagePath string) ([]byte, error) {
 	return os.ReadFile(storagePath)
 }
 
-func (u *localUploader) DownloadFile(filepath, storagePath string) (int64, error) {
-	_, size, err := u.UploadFile(storagePath, filepath, "")
+func (u *localUploader) DownloadFile(localPath, storagePath string) (int64, error) {
+	_, size, err := u.UploadFile(storagePath, localPath, "")
 	return size, err
 }
 
