@@ -29,8 +29,10 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws/retry"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/credentials/stscreds"
 	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/sts"
 	"github.com/aws/smithy-go/middleware"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
 )
@@ -45,6 +47,49 @@ type s3Storage struct {
 }
 
 func NewS3(conf *S3Config) (Storage, error) {
+	var cp aws.CredentialsProvider
+
+	if conf.AccessKey != "" && conf.Secret != "" {
+		cp = credentials.StaticCredentialsProvider{
+			Value: aws.Credentials{
+				AccessKeyID:     conf.AccessKey,
+				SecretAccessKey: conf.Secret,
+				SessionToken:    conf.SessionToken,
+			},
+		}
+	}
+
+	awsConf, err := getConf(conf, cp)
+	if err != nil {
+		return nil, err
+	}
+
+	if conf.AssumedRoleArn != "" {
+		stsSvc := sts.NewFromConfig(*awsConf)
+		cp = stscreds.NewAssumeRoleProvider(stsSvc, conf.AssumedRoleArn, func(o *stscreds.AssumeRoleOptions) {
+			if conf.AssumedRoleExternalId != "" {
+				o.ExternalID = aws.String(conf.AssumedRoleExternalId)
+			}
+		})
+		awsConf, err = getConf(conf, cp)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if conf.Region == "" && conf.Endpoint == "" {
+		if err = updateRegion(awsConf, conf.Bucket); err != nil {
+			return nil, err
+		}
+	}
+
+	return &s3Storage{
+		conf:    conf,
+		awsConf: awsConf,
+	}, nil
+}
+
+func getConf(conf *S3Config, cp aws.CredentialsProvider) (*aws.Config, error) {
 	opts := func(o *config.LoadOptions) error {
 		if conf.Region != "" {
 			o.Region = conf.Region
@@ -52,16 +97,7 @@ func NewS3(conf *S3Config) (Storage, error) {
 			o.Region = defaultBucketLocation
 		}
 
-		if conf.AccessKey != "" && conf.Secret != "" {
-			o.Credentials = credentials.StaticCredentialsProvider{
-				Value: aws.Credentials{
-					AccessKeyID:     conf.AccessKey,
-					SecretAccessKey: conf.Secret,
-					SessionToken:    conf.SessionToken,
-				},
-			}
-		}
-
+		o.Credentials = cp
 		o.Retryer = func() aws.Retryer {
 			return retry.NewStandard(func(o *retry.StandardOptions) {
 				o.MaxAttempts = conf.MaxRetries
@@ -95,16 +131,9 @@ func NewS3(conf *S3Config) (Storage, error) {
 
 	if conf.Endpoint != "" {
 		awsConf.BaseEndpoint = &conf.Endpoint
-	} else if conf.Region == "" {
-		if err = updateRegion(&awsConf, conf.Bucket); err != nil {
-			return nil, err
-		}
 	}
 
-	return &s3Storage{
-		conf:    conf,
-		awsConf: &awsConf,
-	}, nil
+	return &awsConf, nil
 }
 
 func updateRegion(awsConf *aws.Config, bucket string) error {
