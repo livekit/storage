@@ -64,11 +64,11 @@ func NewS3(conf *S3Config) (Storage, error) {
 		return nil, err
 	}
 
-	if conf.AssumedRoleArn != "" {
+	if conf.AssumeRoleArn != "" {
 		stsSvc := sts.NewFromConfig(*awsConf)
-		cp = stscreds.NewAssumeRoleProvider(stsSvc, conf.AssumedRoleArn, func(o *stscreds.AssumeRoleOptions) {
-			if conf.AssumedRoleExternalId != "" {
-				o.ExternalID = aws.String(conf.AssumedRoleExternalId)
+		cp = stscreds.NewAssumeRoleProvider(stsSvc, conf.AssumeRoleArn, func(o *stscreds.AssumeRoleOptions) {
+			if conf.AssumeRoleExternalId != "" {
+				o.ExternalID = aws.String(conf.AssumeRoleExternalId)
 			}
 		})
 		awsConf, err = getConf(conf, cp)
