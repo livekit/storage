@@ -24,6 +24,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/aws/retry"
@@ -35,9 +36,7 @@ import (
 	smithyhttp "github.com/aws/smithy-go/transport/http"
 )
 
-const (
-	defaultBucketLocation = "us-east-1"
-)
+const defaultBucketLocation = "us-east-1"
 
 type s3Storage struct {
 	conf    *S3Config
@@ -246,7 +245,7 @@ func (s *s3Storage) download(w io.WriterAt, storagePath string) (int64, error) {
 	)
 }
 
-func (s *s3Storage) GeneratePresignedUrl(storagePath string) (string, error) {
+func (s *s3Storage) GeneratePresignedUrl(storagePath string, expiration time.Duration) (string, error) {
 	client := s3.NewFromConfig(*s.awsConf, func(o *s3.Options) {
 		o.UsePathStyle = s.conf.ForcePathStyle
 	})
@@ -254,7 +253,7 @@ func (s *s3Storage) GeneratePresignedUrl(storagePath string) (string, error) {
 	res, err := s3.NewPresignClient(client).PresignGetObject(context.Background(), &s3.GetObjectInput{
 		Bucket: aws.String(s.conf.Bucket),
 		Key:    aws.String(storagePath),
-	})
+	}, s3.WithPresignExpires(expiration))
 	if err != nil {
 		return "", err
 	}
