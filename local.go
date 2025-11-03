@@ -155,6 +155,7 @@ func (u *localUploader) DeleteObject(storagePath string) error {
 		}
 
 		storagePath, _ = path.Split(storagePath)
+		storagePath = storagePath[:len(storagePath)-1] // remove trailing slash
 		entries, err := os.ReadDir(storagePath)
 		if err != nil {
 			return err
