@@ -94,7 +94,7 @@ func (u *localUploader) UploadData(data []byte, storagePath, _ string) (string, 
 func (u *localUploader) ListObjects(prefix string) ([]string, error) {
 	absPrefix := path.Join(u.StorageDir, prefix)
 	dir, filenamePrefix := path.Split(absPrefix)
-	
+
 	var files []string
 	entries, err := os.ReadDir(dir)
 	if err != nil {

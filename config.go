@@ -20,12 +20,18 @@ import (
 	"github.com/Azure/azure-storage-blob-go/azblob"
 )
 
+type Config interface {
+	newStorage() (Storage, error)
+}
+
 type AliOSSConfig struct {
 	AccessKey string `yaml:"access_key,omitempty"`
 	Secret    string `yaml:"secret,omitempty"`
 	Endpoint  string `yaml:"endpoint,omitempty"`
 	Bucket    string `yaml:"bucket,omitempty"`
 }
+
+func (c *AliOSSConfig) newStorage() (Storage, error) { return NewAliOSS(c) }
 
 type AzureConfig struct {
 	AccountName     string                 `yaml:"account_name,omitempty"` // (env AZURE_STORAGE_ACCOUNT)
@@ -34,15 +40,21 @@ type AzureConfig struct {
 	TokenCredential azblob.TokenCredential `yaml:"-"` // required for presigned url generation
 }
 
+func (c *AzureConfig) newStorage() (Storage, error) { return NewAzure(c) }
+
 type GCPConfig struct {
 	CredentialsJSON string       `yaml:"credentials_json,omitempty"` // (env GOOGLE_APPLICATION_CREDENTIALS)
 	Bucket          string       `yaml:"bucket,omitempty"`
 	ProxyConfig     *ProxyConfig `yaml:"proxy_config,omitempty"`
 }
 
+func (c *GCPConfig) newStorage() (Storage, error) { return NewGCP(c) }
+
 type LocalConfig struct {
 	StorageDir string `yaml:"storage_dir,omitempty"`
 }
+
+func (c *LocalConfig) newStorage() (Storage, error) { return NewLocal(c) }
 
 type S3Config struct {
 	AccessKey            string       `yaml:"access_key,omitempty"`
@@ -64,6 +76,8 @@ type S3Config struct {
 	Tagging            string            `yaml:"tagging,omitempty"`
 	ContentDisposition string            `yaml:"content_disposition,omitempty"`
 }
+
+func (c *S3Config) newStorage() (Storage, error) { return NewS3(c) }
 
 type ProxyConfig struct {
 	Url      string `yaml:"url,omitempty"`

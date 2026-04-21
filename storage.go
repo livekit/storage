@@ -30,3 +30,7 @@ type Storage interface {
 	DeleteObject(storagePath string) error
 	DeleteObjects(storagePaths []string) error
 }
+
+func New(conf Config) (Storage, error) {
+	return conf.newStorage()
+}
