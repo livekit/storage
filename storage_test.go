@@ -37,7 +37,7 @@ func TestAliOSS(t *testing.T) {
 		t.Skip("Missing env vars")
 	}
 
-	s, err := storage.NewAliOSS(&storage.AliOSSConfig{
+	s, err := storage.New(&storage.AliOSSConfig{
 		AccessKey: key,
 		Secret:    secret,
 		Endpoint:  endpoint,
@@ -57,7 +57,7 @@ func TestAzure(t *testing.T) {
 		t.Skip("Missing env vars")
 	}
 
-	s, err := storage.NewAzure(&storage.AzureConfig{
+	s, err := storage.New(&storage.AzureConfig{
 		AccountName:   name,
 		AccountKey:    key,
 		ContainerName: container,
@@ -75,7 +75,7 @@ func TestGCP(t *testing.T) {
 		t.Skip("Missing env vars")
 	}
 
-	s, err := storage.NewGCP(&storage.GCPConfig{
+	s, err := storage.New(&storage.GCPConfig{
 		CredentialsJSON: creds,
 		Bucket:          bucket,
 	})
@@ -85,7 +85,7 @@ func TestGCP(t *testing.T) {
 }
 
 func TestLocal(t *testing.T) {
-	s, err := storage.NewLocal(&storage.LocalConfig{})
+	s, err := storage.New(&storage.LocalConfig{})
 	require.NoError(t, err)
 
 	testStorage(t, s)
@@ -102,7 +102,7 @@ func TestOCI(t *testing.T) {
 		t.Skip("Missing env vars")
 	}
 
-	s, err := storage.NewS3(&storage.S3Config{
+	s, err := storage.New(&storage.S3Config{
 		AccessKey:      key,
 		Secret:         secret,
 		Region:         region,
@@ -126,7 +126,7 @@ func TestSupabase(t *testing.T) {
 		t.Skip("Missing env vars")
 	}
 
-	s, err := storage.NewS3(&storage.S3Config{
+	s, err := storage.New(&storage.S3Config{
 		AccessKey:      key,
 		Secret:         secret,
 		Region:         region,
@@ -148,7 +148,7 @@ func TestS3(t *testing.T) {
 		t.Skip("Missing env vars")
 	}
 
-	s, err := storage.NewS3(&storage.S3Config{
+	s, err := storage.New(&storage.S3Config{
 		AccessKey:    key,
 		Secret:       secret,
 		SessionToken: os.Getenv("AWS_SESSION_TOKEN"),

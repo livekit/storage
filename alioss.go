@@ -46,22 +46,22 @@ func NewAliOSS(conf *AliOSSConfig) (Storage, error) {
 	}, nil
 }
 
-func (s *aliOSSStorage) UploadData(data []byte, storagePath, _ string) (string, int64, error) {
+func (s *aliOSSStorage) UploadData(data []byte, storagePath, contentType string) (string, int64, error) {
 	reader := bytes.NewBuffer(data)
-	if err := s.bucket.PutObject(storagePath, reader); err != nil {
+	if err := s.bucket.PutObject(storagePath, reader, oss.ContentType(contentType)); err != nil {
 		return "", 0, err
 	}
 
 	return fmt.Sprintf("https://%s.%s/%s", s.conf.Bucket, s.conf.Endpoint, storagePath), int64(len(data)), nil
 }
 
-func (s *aliOSSStorage) UploadFile(filepath, storagePath, _ string) (string, int64, error) {
+func (s *aliOSSStorage) UploadFile(filepath, storagePath, contentType string) (string, int64, error) {
 	info, err := os.Stat(filepath)
 	if err != nil {
 		return "", 0, err
 	}
 
-	if err = s.bucket.PutObjectFromFile(storagePath, filepath); err != nil {
+	if err = s.bucket.PutObjectFromFile(storagePath, filepath, oss.ContentType(contentType)); err != nil {
 		return "", 0, err
 	}
 

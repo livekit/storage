@@ -98,7 +98,10 @@ func (u *localUploader) ListObjects(prefix string) ([]string, error) {
 	var files []string
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return nil, nil
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
 	}
 
 	for _, entry := range entries {
@@ -108,19 +111,27 @@ func (u *localUploader) ListObjects(prefix string) ([]string, error) {
 
 		entryPath := path.Join(dir, entry.Name())
 		if entry.IsDir() {
-			if err = filepath.Walk(entryPath, func(path string, info os.FileInfo, err error) error {
+			if err = filepath.Walk(entryPath, func(p string, info os.FileInfo, err error) error {
 				if err != nil {
 					return err
 				}
 				if !info.IsDir() {
-					files = append(files, path)
+					rel, err := filepath.Rel(u.StorageDir, p)
+					if err != nil {
+						return err
+					}
+					files = append(files, rel)
 				}
 				return nil
 			}); err != nil {
 				return nil, err
 			}
 		} else {
-			files = append(files, entryPath)
+			rel, err := filepath.Rel(u.StorageDir, entryPath)
+			if err != nil {
+				return nil, err
+			}
+			files = append(files, rel)
 		}
 	}
 
@@ -134,23 +145,23 @@ func (u *localUploader) DownloadData(storagePath string) ([]byte, error) {
 func (u *localUploader) DownloadFile(localPath, storagePath string) (int64, error) {
 	storagePath = path.Join(u.StorageDir, storagePath)
 
-	local, err := os.Open(localPath)
+	storage, err := os.Open(storagePath)
 	if err != nil {
 		return 0, err
 	}
-	defer local.Close()
+	defer storage.Close()
 
-	if dir, _ := path.Split(storagePath); dir != "" {
+	if dir, _ := path.Split(localPath); dir != "" {
 		if err = os.MkdirAll(dir, 0755); err != nil {
 			return 0, err
 		}
 	}
 
-	storage, err := os.Create(storagePath)
+	local, err := os.Create(localPath)
 	if err != nil {
 		return 0, err
 	}
-	defer storage.Close()
+	defer local.Close()
 
 	size, err := io.Copy(local, storage)
 	if err != nil {

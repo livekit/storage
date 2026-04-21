@@ -96,7 +96,7 @@ func (s *gcpStorage) UploadFile(filepath, storagePath, contentType string) (stri
 	return s.upload(file, storagePath, contentType)
 }
 
-func (s *gcpStorage) upload(reader io.Reader, storagePath, _ string) (string, int64, error) {
+func (s *gcpStorage) upload(reader io.Reader, storagePath, contentType string) (string, int64, error) {
 	wc := s.client.Bucket(s.conf.Bucket).Object(storagePath).Retryer(
 		storage.WithBackoff(gax.Backoff{
 			Initial:    time.Millisecond * 100,
@@ -106,6 +106,7 @@ func (s *gcpStorage) upload(reader io.Reader, storagePath, _ string) (string, in
 		storage.WithMaxAttempts(5),
 		storage.WithPolicy(storage.RetryAlways),
 	).NewWriter(context.Background())
+	wc.ContentType = contentType
 	wc.ChunkRetryDeadline = 0
 
 	n, err := io.Copy(wc, reader)
@@ -143,13 +144,9 @@ func (s *gcpStorage) DownloadData(storagePath string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	defer rc.Close()
 
-	b := make([]byte, rc.Attrs.Size)
-	_, err = rc.Read(b)
-	if err != nil {
-		return nil, err
-	}
-	return b, nil
+	return io.ReadAll(rc)
 }
 
 func (s *gcpStorage) DownloadFile(filepath, storagePath string) (int64, error) {
@@ -174,21 +171,7 @@ func (s *gcpStorage) DownloadFile(filepath, storagePath string) (int64, error) {
 }
 
 func (s *gcpStorage) download(storagePath string) (*storage.Reader, error) {
-	ctx := context.Background()
-	var client *storage.Client
-
-	var err error
-	if s.conf.CredentialsJSON != "" {
-		client, err = storage.NewClient(ctx, option.WithCredentialsJSON([]byte(s.conf.CredentialsJSON)))
-	} else {
-		client, err = storage.NewClient(ctx)
-	}
-	if err != nil {
-		return nil, err
-	}
-	defer client.Close()
-
-	return client.Bucket(s.conf.Bucket).Object(storagePath).Retryer(
+	return s.client.Bucket(s.conf.Bucket).Object(storagePath).Retryer(
 		storage.WithBackoff(
 			gax.Backoff{
 				Initial:    time.Millisecond * 100,
@@ -196,7 +179,7 @@ func (s *gcpStorage) download(storagePath string) (*storage.Reader, error) {
 				Multiplier: 2,
 			}),
 		storage.WithPolicy(storage.RetryAlways),
-	).NewReader(ctx)
+	).NewReader(context.Background())
 }
 
 func (s *gcpStorage) GeneratePresignedUrl(storagePath string, expiration time.Duration) (string, error) {
