@@ -133,10 +133,15 @@ func (s *azureBLOBStorage) ListObjects(prefix string) ([]string, error) {
 }
 
 func (s *azureBLOBStorage) DownloadData(storagePath string) ([]byte, error) {
-	b := make([]byte, 0)
-
 	blobUrl := s.containerUrl.NewBlobURL(storagePath)
-	err := azblob.DownloadBlobToBuffer(context.Background(), blobUrl, 0, azblob.CountToEnd, b, azblob.DownloadFromBlobOptions{
+
+	props, err := blobUrl.GetProperties(context.Background(), azblob.BlobAccessConditions{}, azblob.ClientProvidedKeyOptions{})
+	if err != nil {
+		return nil, err
+	}
+
+	b := make([]byte, props.ContentLength())
+	err = azblob.DownloadBlobToBuffer(context.Background(), blobUrl, 0, azblob.CountToEnd, b, azblob.DownloadFromBlobOptions{
 		BlockSize:   4 * 1024 * 1024,
 		Parallelism: 16,
 		RetryReaderOptionsPerBlock: azblob.RetryReaderOptions{
@@ -204,7 +209,7 @@ func (s *azureBLOBStorage) GeneratePresignedUrl(storagePath string, expiration t
 		return "", err
 	}
 
-	return fmt.Sprintf("https://%s.blob.core.windows.net?%s", s.conf.AccountName, qp.Encode()), nil
+	return fmt.Sprintf("https://%s.blob.core.windows.net/%s/%s?%s", s.conf.AccountName, s.conf.ContainerName, storagePath, qp.Encode()), nil
 }
 
 func (s *azureBLOBStorage) DeleteObject(storagePath string) error {
