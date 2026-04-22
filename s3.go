@@ -169,9 +169,12 @@ func (s *s3Storage) getClient(l logging.Logger) *s3.Client {
 
 		o.UsePathStyle = s.conf.ForcePathStyle
 
-		// switch to md5 checksum for oracle cloud
+		// switch to md5 checksum for providers that don't support AWS SDK v2
+		// flexible checksums (e.g. Oracle Cloud, UpCloud)
 		if s.conf.Endpoint != "" {
-			if parsed, err := url.Parse(s.conf.Endpoint); err == nil && strings.HasSuffix(parsed.Host, "oraclecloud.com") {
+			if parsed, err := url.Parse(s.conf.Endpoint); err == nil &&
+				(strings.HasSuffix(parsed.Host, "oraclecloud.com") ||
+					strings.HasSuffix(parsed.Host, "upcloudobjects.com")) {
 				o.APIOptions = append(o.APIOptions, func(stack *middleware.Stack) error {
 					stack.Initialize.Remove("AWSChecksum:SetupInputContext")
 					stack.Build.Remove("AWSChecksum:RequestMetricsTracking")
