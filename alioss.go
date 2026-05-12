@@ -16,9 +16,10 @@ package storage
 
 import (
 	"bytes"
-	"fmt"
 	"io"
+	"net/url"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/aliyun/aliyun-oss-go-sdk/oss"
@@ -52,7 +53,7 @@ func (s *aliOSSStorage) UploadData(data []byte, storagePath, contentType string)
 		return "", 0, err
 	}
 
-	return fmt.Sprintf("https://%s.%s/%s", s.conf.Bucket, s.conf.Endpoint, storagePath), int64(len(data)), nil
+	return s.location(storagePath), int64(len(data)), nil
 }
 
 func (s *aliOSSStorage) UploadFile(filepath, storagePath, contentType string) (string, int64, error) {
@@ -65,7 +66,14 @@ func (s *aliOSSStorage) UploadFile(filepath, storagePath, contentType string) (s
 		return "", 0, err
 	}
 
-	return fmt.Sprintf("https://%s.%s/%s", s.conf.Bucket, s.conf.Endpoint, storagePath), info.Size(), nil
+	return s.location(storagePath), info.Size(), nil
+}
+
+func (s *aliOSSStorage) location(storagePath string) string {
+	endpoint := strings.TrimPrefix(s.conf.Endpoint, "https://")
+	endpoint = strings.TrimPrefix(endpoint, "http://")
+	u := url.URL{Scheme: "https", Host: s.conf.Bucket + "." + endpoint, Path: "/" + storagePath}
+	return u.String()
 }
 
 func (s *aliOSSStorage) ListObjects(prefix string) ([]string, error) {

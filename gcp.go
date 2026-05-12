@@ -118,7 +118,8 @@ func (s *gcpStorage) upload(reader io.Reader, storagePath, contentType string) (
 		return "", 0, err
 	}
 
-	return fmt.Sprintf("https://%s.storage.googleapis.com/%s", s.conf.Bucket, storagePath), n, nil
+	loc := url.URL{Scheme: "https", Host: s.conf.Bucket + ".storage.googleapis.com", Path: "/" + storagePath}
+	return loc.String(), n, nil
 }
 
 func (s *gcpStorage) ListObjects(prefix string) ([]string, error) {

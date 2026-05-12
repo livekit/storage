@@ -27,7 +27,6 @@ import (
 
 type azureBLOBStorage struct {
 	conf         *AzureConfig
-	container    string
 	containerUrl azblob.ContainerURL
 	serviceUrl   azblob.ServiceURL
 }
@@ -63,10 +62,17 @@ func NewAzure(conf *AzureConfig) (Storage, error) {
 
 	return &azureBLOBStorage{
 		conf:         conf,
-		container:    sUrl,
 		serviceUrl:   azblob.NewServiceURL(*serviceUrl, pipeline),
 		containerUrl: azblob.NewContainerURL(*containerUrl, pipeline),
 	}, nil
+}
+
+func (s *azureBLOBStorage) location(storagePath string) *url.URL {
+	return &url.URL{
+		Scheme: "https",
+		Host:   s.conf.AccountName + ".blob.core.windows.net",
+		Path:   "/" + s.conf.ContainerName + "/" + storagePath,
+	}
 }
 
 func (s *azureBLOBStorage) UploadData(data []byte, storagePath, contentType string) (string, int64, error) {
@@ -80,7 +86,7 @@ func (s *azureBLOBStorage) UploadData(data []byte, storagePath, contentType stri
 		return "", 0, err
 	}
 
-	return fmt.Sprintf("%s/%s", s.container, storagePath), int64(len(data)), nil
+	return s.location(storagePath).String(), int64(len(data)), nil
 }
 
 func (s *azureBLOBStorage) UploadFile(filepath, storagePath, contentType string) (string, int64, error) {
@@ -109,7 +115,7 @@ func (s *azureBLOBStorage) UploadFile(filepath, storagePath, contentType string)
 		return "", 0, err
 	}
 
-	return fmt.Sprintf("%s/%s", s.container, storagePath), stat.Size(), nil
+	return s.location(storagePath).String(), stat.Size(), nil
 }
 
 func (s *azureBLOBStorage) ListObjects(prefix string) ([]string, error) {
@@ -209,7 +215,9 @@ func (s *azureBLOBStorage) GeneratePresignedUrl(storagePath string, expiration t
 		return "", err
 	}
 
-	return fmt.Sprintf("https://%s.blob.core.windows.net/%s/%s?%s", s.conf.AccountName, s.conf.ContainerName, storagePath, qp.Encode()), nil
+	loc := s.location(storagePath)
+	loc.RawQuery = qp.Encode()
+	return loc.String(), nil
 }
 
 func (s *azureBLOBStorage) DeleteObject(storagePath string) error {

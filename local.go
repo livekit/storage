@@ -15,8 +15,8 @@
 package storage
 
 import (
-	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"path"
 	"path/filepath"
@@ -172,7 +172,8 @@ func (u *localUploader) DownloadFile(localPath, storagePath string) (int64, erro
 }
 
 func (u *localUploader) GeneratePresignedUrl(storagePath string, _ time.Duration) (string, error) {
-	return fmt.Sprintf("file://%s", path.Join(u.StorageDir, storagePath)), nil
+	abs := filepath.Join(u.StorageDir, storagePath)
+	return (&url.URL{Scheme: "file", Path: filepath.ToSlash(abs)}).String(), nil
 }
 
 func (u *localUploader) DeleteObject(storagePath string) error {
