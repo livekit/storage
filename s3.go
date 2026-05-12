@@ -36,8 +36,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
 	"github.com/aws/smithy-go/logging"
-	"github.com/aws/smithy-go/middleware"
-	smithyhttp "github.com/aws/smithy-go/transport/http"
 )
 
 const defaultBucketLocation = "us-east-1"
@@ -169,17 +167,10 @@ func (s *s3Storage) getClient(l logging.Logger) *s3.Client {
 
 		o.UsePathStyle = s.conf.ForcePathStyle
 
-		// switch to md5 checksum for oracle cloud
 		if s.conf.Endpoint != "" {
-			if parsed, err := url.Parse(s.conf.Endpoint); err == nil && strings.HasSuffix(parsed.Host, "oraclecloud.com") {
-				o.APIOptions = append(o.APIOptions, func(stack *middleware.Stack) error {
-					stack.Initialize.Remove("AWSChecksum:SetupInputContext")
-					stack.Build.Remove("AWSChecksum:RequestMetricsTracking")
-					stack.Finalize.Remove("AWSChecksum:ComputeInputPayloadChecksum")
-					stack.Finalize.Remove("addInputChecksumTrailer")
-					return smithyhttp.AddContentChecksumMiddleware(stack)
-				})
-			}
+			// needed for compatibility with non-AWS S3-compatible providers (Oracle, etc.)
+			o.RequestChecksumCalculation = aws.RequestChecksumCalculationWhenRequired
+			o.ResponseChecksumValidation = aws.ResponseChecksumValidationWhenRequired
 		}
 	})
 }
@@ -244,18 +235,19 @@ func (s *s3Storage) upload(reader io.Reader, storagePath, contentType string) (s
 	if s.conf.Endpoint != "" {
 		endpoint = s.conf.Endpoint
 	}
+	endpoint = strings.TrimPrefix(endpoint, "https://")
+	endpoint = strings.TrimPrefix(endpoint, "http://")
 
-	var location string
+	loc := url.URL{Scheme: "https"}
 	if s.conf.ForcePathStyle {
-		if !strings.HasPrefix(endpoint, "http") {
-			endpoint = "https://" + endpoint
-		}
-		location = fmt.Sprintf("%s/%s/%s", endpoint, s.conf.Bucket, storagePath)
+		loc.Host = endpoint
+		loc.Path = "/" + s.conf.Bucket + "/" + storagePath
 	} else {
-		location = fmt.Sprintf("https://%s.%s/%s", s.conf.Bucket, endpoint, storagePath)
+		loc.Host = s.conf.Bucket + "." + endpoint
+		loc.Path = "/" + storagePath
 	}
 
-	return location, nil
+	return loc.String(), nil
 }
 
 func (s *s3Storage) ListObjects(prefix string) ([]string, error) {
@@ -352,13 +344,19 @@ func (s *s3Storage) DeleteObjects(storagePaths []string) error {
 			objects = append(objects, types.ObjectIdentifier{Key: aws.String(path)})
 		}
 
-		_, err := client.DeleteObjects(context.Background(), &s3.DeleteObjectsInput{
+		deleteInput := &s3.DeleteObjectsInput{
 			Bucket: aws.String(s.conf.Bucket),
 			Delete: &types.Delete{
 				Objects: objects,
 				Quiet:   aws.Bool(true),
 			},
-		})
+		}
+		if s.conf.Endpoint != "" {
+			// SHA256 is supported by most S3-compatible backends
+			deleteInput.ChecksumAlgorithm = types.ChecksumAlgorithmSha256
+		}
+
+		_, err := client.DeleteObjects(context.Background(), deleteInput)
 		if err != nil {
 			return err
 		}
