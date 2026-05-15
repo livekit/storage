@@ -226,7 +226,25 @@ func (s *s3Storage) upload(reader io.Reader, storagePath, contentType string) (s
 		input.ContentDisposition = &contentDisposition
 	}
 
-	if _, err := manager.NewUploader(client).Upload(context.Background(), input); err != nil {
+	uploader := manager.NewUploader(client, func(u *manager.Uploader) {
+		if s.conf.Endpoint != "" {
+			// S3-compatible providers commonly don't support AWS SDK v2's
+			// chunked transfer encoding (STREAMING-UNSIGNED-PAYLOAD-TRAILER)
+			// that the uploader uses for UploadPart, and reject every part
+			// with XAmzContentSHA256Mismatch (see UpCloud, older Ceph RGW,
+			// Oracle Cloud Storage, etc.). Routing through a single
+			// PutObject — which uses classic SigV4 with a pre-computed body
+			// hash — works across all S3-compatible backends. Raising
+			// PartSize to the 5 GiB single-PutObject limit makes the
+			// uploader take that path for any body that fits in one part.
+			//
+			// Bodies above 5 GiB will still attempt multipart and fail on
+			// affected backends; egress recordings are not expected to
+			// exceed this in practice.
+			u.PartSize = 5 * 1024 * 1024 * 1024
+		}
+	})
+	if _, err := uploader.Upload(context.Background(), input); err != nil {
 		l.WriteLogs()
 		return "", err
 	}
