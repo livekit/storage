@@ -36,6 +36,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
 	"github.com/aws/smithy-go/logging"
+	"github.com/aws/smithy-go/middleware"
 )
 
 const defaultBucketLocation = "us-east-1"
@@ -226,7 +227,34 @@ func (s *s3Storage) upload(reader io.Reader, storagePath, contentType string) (s
 		input.ContentDisposition = &contentDisposition
 	}
 
-	if _, err := manager.NewUploader(client).Upload(context.Background(), input); err != nil {
+	// Uploader forces a CRC32 ChecksumAlgorithm on multipart uploads,
+	// which makes UploadPart use a trailing checksum encoded as Content-Encoding:
+	// aws-chunked. Non-AWS S3-compatible providers (e.g. OCI) don't support
+	// this, so clear the algorithm before any checksum middleware sees it.
+	uploader := manager.NewUploader(client, func(u *manager.Uploader) {
+		if s.conf.Endpoint != "" {
+			u.ClientOptions = append(u.ClientOptions, func(o *s3.Options) {
+				o.APIOptions = append(o.APIOptions, func(stack *middleware.Stack) error {
+					return stack.Initialize.Add(middleware.InitializeMiddlewareFunc(
+						"ClearMultipartChecksum",
+						func(ctx context.Context, in middleware.InitializeInput, next middleware.InitializeHandler) (
+							middleware.InitializeOutput, middleware.Metadata, error,
+						) {
+							switch v := in.Parameters.(type) {
+							case *s3.CreateMultipartUploadInput:
+								v.ChecksumAlgorithm = ""
+							case *s3.UploadPartInput:
+								v.ChecksumAlgorithm = ""
+							}
+							return next.HandleInitialize(ctx, in)
+						},
+					), middleware.Before)
+				})
+			})
+		}
+	})
+
+	if _, err := uploader.Upload(context.Background(), input); err != nil {
 		l.WriteLogs()
 		return "", err
 	}
