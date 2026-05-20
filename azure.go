@@ -20,9 +20,12 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/Azure/azure-storage-blob-go/azblob"
+
+	"github.com/livekit/protocol/logger"
 )
 
 type azureBLOBStorage struct {
@@ -32,12 +35,35 @@ type azureBLOBStorage struct {
 }
 
 func NewAzure(conf *AzureConfig) (Storage, error) {
-	credential, err := azblob.NewSharedKeyCredential(
-		conf.AccountName,
-		conf.AccountKey,
-	)
-	if err != nil {
-		return nil, err
+	if conf.AccountName == "" {
+		return nil, errors.New("azure: account_name is required")
+	}
+	if conf.ContainerName == "" {
+		return nil, errors.New("azure: container_name is required")
+	}
+
+	sasToken := strings.TrimPrefix(conf.SASToken, "?")
+
+	var credential azblob.Credential
+	switch {
+	case sasToken != "":
+		if conf.AccountKey != "" {
+			logger.Warnw("azure: both account_key and sas_token configured, using sas_token", nil)
+		}
+		credential = azblob.NewAnonymousCredential()
+	case conf.AccountKey != "":
+		sharedKeyCred, err := azblob.NewSharedKeyCredential(
+			conf.AccountName,
+			conf.AccountKey,
+		)
+		if err != nil {
+			return nil, err
+		}
+		credential = sharedKeyCred
+	case conf.TokenCredential != nil:
+		credential = conf.TokenCredential
+	default:
+		return nil, errors.New("azure: one of account_key, sas_token, or TokenCredential is required")
 	}
 
 	pipeline := azblob.NewPipeline(credential, azblob.PipelineOptions{
@@ -55,6 +81,9 @@ func NewAzure(conf *AzureConfig) (Storage, error) {
 	}
 
 	cUrl := fmt.Sprintf("%s/%s", sUrl, conf.ContainerName)
+	if sasToken != "" {
+		cUrl = fmt.Sprintf("%s?%s", cUrl, sasToken)
+	}
 	containerUrl, err := url.Parse(cUrl)
 	if err != nil {
 		return nil, err
@@ -188,6 +217,14 @@ func (s *azureBLOBStorage) DownloadFile(filepath, storagePath string) (int64, er
 }
 
 func (s *azureBLOBStorage) GeneratePresignedUrl(storagePath string, expiration time.Duration) (string, error) {
+	if sasToken := strings.TrimPrefix(s.conf.SASToken, "?"); sasToken != "" {
+		// When a pre-generated SASToken is configured, return the blob URL with the SAS appended.
+		// The returned URL's capabilities and lifetime are defined by the SAS itself; the
+		// expiration argument is ignored.
+		return fmt.Sprintf("https://%s.blob.core.windows.net/%s/%s?%s",
+			s.conf.AccountName, s.conf.ContainerName, storagePath, sasToken), nil
+	}
+
 	if s.conf.TokenCredential == nil {
 		return "", errors.New("OAuth required")
 	}

@@ -36,8 +36,9 @@ func (c *AliOSSConfig) newStorage() (Storage, error) { return NewAliOSS(c) }
 type AzureConfig struct {
 	AccountName     string                 `yaml:"account_name,omitempty"` // (env AZURE_STORAGE_ACCOUNT)
 	AccountKey      string                 `yaml:"account_key,omitempty"`  // (env AZURE_STORAGE_KEY)
+	SASToken        string                 `yaml:"sas_token,omitempty"`    // Account or Service SAS query string (with or without leading '?'); preferred over AccountKey when set
 	ContainerName   string                 `yaml:"container_name,omitempty"`
-	TokenCredential azblob.TokenCredential `yaml:"-"` // required for presigned url generation
+	TokenCredential azblob.TokenCredential `yaml:"-"` // required for presigned url generation when SASToken is not set
 }
 
 func (c *AzureConfig) newStorage() (Storage, error) { return NewAzure(c) }
