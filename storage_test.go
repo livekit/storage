@@ -15,6 +15,7 @@
 package storage_test
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"net/http"
@@ -286,6 +287,30 @@ func testStorage(t *testing.T, s storage.Storage) {
 		items, err := s.ListObjects(prefix)
 		require.NoError(t, err)
 		require.Empty(t, items)
+	})
+
+	t.Run("Multipart", func(t *testing.T) {
+		pathMultipart := prefix + "-multipart.bin"
+		t.Cleanup(func() {
+			_ = s.DeleteObject(pathMultipart)
+		})
+
+		// 6 MiB exceeds the S3 manager's default 5 MiB part size, forcing the
+		// multipart upload path (CreateMultipartUpload / UploadPart / Complete).
+		payload := make([]byte, 6<<20)
+		for i := range payload {
+			payload[i] = byte(i)
+		}
+
+		loc, size, err := s.UploadData(payload, pathMultipart, "application/octet-stream")
+		require.NoError(t, err)
+		require.Equal(t, int64(len(payload)), size)
+		assertLocation(t, loc, pathMultipart)
+
+		downloaded, err := s.DownloadData(pathMultipart)
+		require.NoError(t, err)
+		require.Equal(t, len(payload), len(downloaded))
+		require.True(t, bytes.Equal(payload, downloaded), "downloaded multipart content does not match uploaded")
 	})
 }
 
