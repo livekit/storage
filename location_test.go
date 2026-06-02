@@ -72,12 +72,10 @@ func TestAliOSSLocation(t *testing.T) {
 		},
 	}
 	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			s := &aliOSSStorage{conf: &tc.conf}
-			got := s.location(tc.storagePath)
-			require.Equal(t, tc.want, got)
-			requireWellFormedHTTPLocation(t, got)
-		})
+		s := &aliOSSStorage{conf: &tc.conf}
+		got := s.location(tc.storagePath)
+		require.Equal(t, tc.want, got, tc.name)
+		requireWellFormedHTTPLocation(t, got, tc.name)
 	}
 }
 
@@ -138,12 +136,10 @@ func TestAzureLocation(t *testing.T) {
 		},
 	}
 	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			s := &azureBLOBStorage{conf: &tc.conf}
-			got := s.location(tc.storagePath)
-			require.Equal(t, tc.want, got)
-			requireWellFormedHTTPLocation(t, got)
-		})
+		s := &azureBLOBStorage{conf: &tc.conf}
+		got := s.location(tc.storagePath)
+		require.Equal(t, tc.want, got, tc.name)
+		requireWellFormedHTTPLocation(t, got, tc.name)
 	}
 }
 
@@ -186,12 +182,10 @@ func TestGCPLocation(t *testing.T) {
 		},
 	}
 	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			s := &gcpStorage{conf: &tc.conf}
-			got := s.location(tc.storagePath)
-			require.Equal(t, tc.want, got)
-			requireWellFormedHTTPLocation(t, got)
-		})
+		s := &gcpStorage{conf: &tc.conf}
+		got := s.location(tc.storagePath)
+		require.Equal(t, tc.want, got, tc.name)
+		requireWellFormedHTTPLocation(t, got, tc.name)
 	}
 }
 
@@ -276,12 +270,10 @@ func TestS3Location(t *testing.T) {
 		},
 	}
 	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			s := &s3Storage{conf: &tc.conf}
-			got := s.location(tc.storagePath)
-			require.Equal(t, tc.want, got)
-			requireWellFormedHTTPLocation(t, got)
-		})
+		s := &s3Storage{conf: &tc.conf}
+		got := s.location(tc.storagePath)
+		require.Equal(t, tc.want, got, tc.name)
+		requireWellFormedHTTPLocation(t, got, tc.name)
 	}
 }
 
@@ -318,21 +310,19 @@ func TestLocalLocation(t *testing.T) {
 		},
 	}
 	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			u := &localUploader{StorageDir: tc.storageDir}
-			require.Equal(t, tc.want, u.location(tc.storagePath))
-		})
+		u := &localUploader{StorageDir: tc.storageDir}
+		require.Equal(t, tc.want, u.location(tc.storagePath))
 	}
 }
 
 // requireWellFormedHTTPLocation verifies an https:// location URL is parseable,
 // uses the https scheme, has a non-empty host, and contains no accidental
 // double-slashes in its path (the original Azure bug).
-func requireWellFormedHTTPLocation(t *testing.T, raw string) {
+func requireWellFormedHTTPLocation(t *testing.T, raw string, testName string) {
 	t.Helper()
 	u, err := url.Parse(raw)
-	require.NoError(t, err, "url should parse: %q", raw)
-	require.Equal(t, "https", u.Scheme, "expected https scheme: %q", raw)
-	require.NotEmpty(t, u.Host, "host should not be empty: %q", raw)
-	require.NotContains(t, u.Path, "//", "url path should not contain //: %q", raw)
+	require.NoError(t, err, "%s: url should parse: %q", testName, raw)
+	require.Equal(t, "https", u.Scheme, "%s: expected https scheme: %q", testName, raw)
+	require.NotEmpty(t, u.Host, "%s: host should not be empty: %q", testName, raw)
+	require.NotContains(t, u.Path, "//", "%s: url path should not contain //: %q", testName, raw)
 }
