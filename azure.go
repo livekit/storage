@@ -49,31 +49,27 @@ func NewAzure(conf *AzureConfig) (Storage, error) {
 		},
 	})
 
-	sUrl := fmt.Sprintf("https://%s.blob.core.windows.net", conf.AccountName)
-	serviceUrl, err := url.Parse(sUrl)
-	if err != nil {
-		return nil, err
-	}
-
-	cUrl := path.Join(sUrl, conf.ContainerName)
-	containerUrl, err := url.Parse(cUrl)
-	if err != nil {
-		return nil, err
-	}
-
+	host := fmt.Sprintf("%s.blob.core.windows.net", conf.AccountName)
 	return &azureBLOBStorage{
-		conf:         conf,
-		serviceUrl:   azblob.NewServiceURL(*serviceUrl, pipeline),
-		containerUrl: azblob.NewContainerURL(*containerUrl, pipeline),
+		conf: conf,
+		serviceUrl: azblob.NewServiceURL(url.URL{
+			Scheme: "https",
+			Host:   host,
+		}, pipeline),
+		containerUrl: azblob.NewContainerURL(url.URL{
+			Scheme: "https",
+			Host:   host,
+			Path:   conf.ContainerName,
+		}, pipeline),
 	}, nil
 }
 
-func (s *azureBLOBStorage) location(storagePath string) *url.URL {
-	return &url.URL{
+func (s *azureBLOBStorage) location(storagePath string) string {
+	return (&url.URL{
 		Scheme: "https",
 		Host:   s.conf.AccountName + ".blob.core.windows.net",
 		Path:   path.Join(s.conf.ContainerName, storagePath),
-	}
+	}).String()
 }
 
 func (s *azureBLOBStorage) UploadData(data []byte, storagePath, contentType string) (string, int64, error) {
@@ -87,7 +83,7 @@ func (s *azureBLOBStorage) UploadData(data []byte, storagePath, contentType stri
 		return "", 0, err
 	}
 
-	return s.location(storagePath).String(), int64(len(data)), nil
+	return s.location(storagePath), int64(len(data)), nil
 }
 
 func (s *azureBLOBStorage) UploadFile(filepath, storagePath, contentType string) (string, int64, error) {
@@ -116,7 +112,7 @@ func (s *azureBLOBStorage) UploadFile(filepath, storagePath, contentType string)
 		return "", 0, err
 	}
 
-	return s.location(storagePath).String(), stat.Size(), nil
+	return s.location(storagePath), stat.Size(), nil
 }
 
 func (s *azureBLOBStorage) ListObjects(prefix string) ([]string, error) {
@@ -216,8 +212,12 @@ func (s *azureBLOBStorage) GeneratePresignedUrl(storagePath string, expiration t
 		return "", err
 	}
 
-	loc := s.location(storagePath)
-	loc.RawQuery = qp.Encode()
+	loc := &url.URL{
+		Scheme:   "https",
+		Host:     s.conf.AccountName + ".blob.core.windows.net",
+		Path:     path.Join(s.conf.ContainerName, storagePath),
+		RawQuery: qp.Encode(),
+	}
 	return loc.String(), nil
 }
 

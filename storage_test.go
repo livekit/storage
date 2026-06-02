@@ -208,12 +208,8 @@ func testStorage(t *testing.T, s storage.Storage) {
 		require.NoError(t, err)
 		require.Len(t, items, 2)
 
-		var keys []string
-		for _, item := range items {
-			keys = append(keys, item)
-		}
-		require.True(t, hasSuffixIn(keys, pathData), "expected %s in %v", pathData, keys)
-		require.True(t, hasSuffixIn(keys, pathFile), "expected %s in %v", pathFile, keys)
+		require.True(t, hasSuffixIn(items, pathData), "expected %s in %v", pathData, items)
+		require.True(t, hasSuffixIn(items, pathFile), "expected %s in %v", pathFile, items)
 	})
 
 	t.Run("DownloadData", func(t *testing.T) {
