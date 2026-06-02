@@ -118,7 +118,7 @@ func (s *gcpStorage) upload(reader io.Reader, storagePath, contentType string) (
 		return "", 0, err
 	}
 
-	loc := url.URL{Scheme: "https", Host: s.conf.Bucket + ".storage.googleapis.com", Path: "/" + storagePath}
+	loc := url.URL{Scheme: "https", Host: s.conf.Bucket + ".storage.googleapis.com", Path: storagePath}
 	return loc.String(), n, nil
 }
 

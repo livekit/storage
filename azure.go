@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"path"
 	"time"
 
 	"github.com/Azure/azure-storage-blob-go/azblob"
@@ -54,7 +55,7 @@ func NewAzure(conf *AzureConfig) (Storage, error) {
 		return nil, err
 	}
 
-	cUrl := fmt.Sprintf("%s/%s", sUrl, conf.ContainerName)
+	cUrl := path.Join(sUrl, conf.ContainerName)
 	containerUrl, err := url.Parse(cUrl)
 	if err != nil {
 		return nil, err
@@ -71,7 +72,7 @@ func (s *azureBLOBStorage) location(storagePath string) *url.URL {
 	return &url.URL{
 		Scheme: "https",
 		Host:   s.conf.AccountName + ".blob.core.windows.net",
-		Path:   "/" + s.conf.ContainerName + "/" + storagePath,
+		Path:   path.Join(s.conf.ContainerName, storagePath),
 	}
 }
 
