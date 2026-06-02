@@ -72,7 +72,7 @@ func (s *aliOSSStorage) UploadFile(filepath, storagePath, contentType string) (s
 func (s *aliOSSStorage) location(storagePath string) string {
 	endpoint := strings.TrimPrefix(s.conf.Endpoint, "https://")
 	endpoint = strings.TrimPrefix(endpoint, "http://")
-	u := url.URL{Scheme: "https", Host: s.conf.Bucket + "." + endpoint, Path: "/" + storagePath}
+	u := url.URL{Scheme: "https", Host: s.conf.Bucket + "." + endpoint, Path: storagePath}
 	return u.String()
 }
 

@@ -23,6 +23,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path"
 	"strings"
 	"time"
 
@@ -269,10 +270,10 @@ func (s *s3Storage) upload(reader io.Reader, storagePath, contentType string) (s
 	loc := url.URL{Scheme: "https"}
 	if s.conf.ForcePathStyle {
 		loc.Host = endpoint
-		loc.Path = "/" + s.conf.Bucket + "/" + storagePath
+		loc.Path = path.Join(s.conf.Bucket, storagePath)
 	} else {
 		loc.Host = s.conf.Bucket + "." + endpoint
-		loc.Path = "/" + storagePath
+		loc.Path = storagePath
 	}
 
 	return loc.String(), nil
