@@ -49,22 +49,18 @@ func NewAzure(conf *AzureConfig) (Storage, error) {
 		},
 	})
 
-	sUrl := fmt.Sprintf("https://%s.blob.core.windows.net", conf.AccountName)
-	serviceUrl, err := url.Parse(sUrl)
-	if err != nil {
-		return nil, err
-	}
-
-	cUrl := path.Join(sUrl, conf.ContainerName)
-	containerUrl, err := url.Parse(cUrl)
-	if err != nil {
-		return nil, err
-	}
-
+	host := fmt.Sprintf("%s.blob.core.windows.net", conf.AccountName)
 	return &azureBLOBStorage{
-		conf:         conf,
-		serviceUrl:   azblob.NewServiceURL(*serviceUrl, pipeline),
-		containerUrl: azblob.NewContainerURL(*containerUrl, pipeline),
+		conf: conf,
+		serviceUrl: azblob.NewServiceURL(url.URL{
+			Scheme: "https",
+			Host:   host,
+		}, pipeline),
+		containerUrl: azblob.NewContainerURL(url.URL{
+			Scheme: "https",
+			Host:   host,
+			Path:   conf.ContainerName,
+		}, pipeline),
 	}, nil
 }
 
