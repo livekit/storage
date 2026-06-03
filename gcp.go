@@ -118,15 +118,8 @@ func (s *gcpStorage) upload(reader io.Reader, storagePath, contentType string) (
 		return "", 0, err
 	}
 
-	return s.location(storagePath), n, nil
-}
-
-func (s *gcpStorage) location(storagePath string) string {
-	return (&url.URL{
-		Scheme: "https",
-		Host:   s.conf.Bucket + ".storage.googleapis.com",
-		Path:   storagePath,
-	}).String()
+	loc := url.URL{Scheme: "https", Host: s.conf.Bucket + ".storage.googleapis.com", Path: storagePath}
+	return loc.String(), n, nil
 }
 
 func (s *gcpStorage) ListObjects(prefix string) ([]string, error) {

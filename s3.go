@@ -260,10 +260,6 @@ func (s *s3Storage) upload(reader io.Reader, storagePath, contentType string) (s
 		return "", err
 	}
 
-	return s.location(storagePath), nil
-}
-
-func (s *s3Storage) location(storagePath string) string {
 	endpoint := "s3.amazonaws.com"
 	if s.conf.Endpoint != "" {
 		endpoint = s.conf.Endpoint
@@ -279,7 +275,8 @@ func (s *s3Storage) location(storagePath string) string {
 		loc.Host = s.conf.Bucket + "." + endpoint
 		loc.Path = storagePath
 	}
-	return loc.String()
+
+	return loc.String(), nil
 }
 
 func (s *s3Storage) ListObjects(prefix string) ([]string, error) {

@@ -40,7 +40,7 @@ func NewLocal(conf *LocalConfig) (Storage, error) {
 }
 
 func (u *localUploader) UploadFile(localPath, storagePath string, _ string) (string, int64, error) {
-	storagePath = u.location(storagePath)
+	storagePath = path.Join(u.StorageDir, storagePath)
 
 	local, err := os.Open(localPath)
 	if err != nil {
@@ -69,7 +69,7 @@ func (u *localUploader) UploadFile(localPath, storagePath string, _ string) (str
 }
 
 func (u *localUploader) UploadData(data []byte, storagePath, _ string) (string, int64, error) {
-	storagePath = u.location(storagePath)
+	storagePath = path.Join(u.StorageDir, storagePath)
 
 	if dir, _ := path.Split(storagePath); dir != "" {
 		if err := os.MkdirAll(dir, 0755); err != nil {
@@ -89,10 +89,6 @@ func (u *localUploader) UploadData(data []byte, storagePath, _ string) (string, 
 	}
 
 	return storagePath, int64(size), nil
-}
-
-func (u *localUploader) location(storagePath string) string {
-	return path.Join(u.StorageDir, storagePath)
 }
 
 func (u *localUploader) ListObjects(prefix string) ([]string, error) {
