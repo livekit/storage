@@ -17,7 +17,7 @@ package storage
 import (
 	"time"
 
-	"github.com/Azure/azure-storage-blob-go/azblob"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 )
 
 type Config interface {
@@ -37,7 +37,7 @@ type AzureConfig struct {
 	AccountName     string                 `yaml:"account_name,omitempty"` // (env AZURE_STORAGE_ACCOUNT)
 	AccountKey      string                 `yaml:"account_key,omitempty"`  // (env AZURE_STORAGE_KEY)
 	ContainerName   string                 `yaml:"container_name,omitempty"`
-	TokenCredential azblob.TokenCredential `yaml:"-"` // required for presigned url generation
+	TokenCredential azcore.TokenCredential `yaml:"-"` // required for presigned url generation
 }
 
 func (c *AzureConfig) newStorage() (Storage, error) { return NewAzure(c) }
