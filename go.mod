@@ -16,7 +16,7 @@ require (
 	github.com/aws/smithy-go v1.22.4
 	github.com/googleapis/gax-go/v2 v2.14.2
 	github.com/joho/godotenv v1.5.1
-	github.com/livekit/protocol v1.46.6-0.20260604183504-b6c88bd4c277
+	github.com/livekit/protocol v1.46.6-0.20260604204719-ab1b54f925cf
 	github.com/stretchr/testify v1.11.1
 	golang.org/x/oauth2 v0.36.0
 	google.golang.org/api v0.238.0
@@ -73,6 +73,7 @@ require (
 	go.opentelemetry.io/otel/sdk v1.43.0 // indirect
 	go.opentelemetry.io/otel/sdk/metric v1.43.0 // indirect
 	go.opentelemetry.io/otel/trace v1.44.0 // indirect
+	go.uber.org/atomic v1.11.0 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
 	go.uber.org/zap v1.28.0 // indirect
 	go.uber.org/zap/exp v0.3.0 // indirect
