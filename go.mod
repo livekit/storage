@@ -16,7 +16,7 @@ require (
 	github.com/aws/smithy-go v1.27.1
 	github.com/googleapis/gax-go/v2 v2.22.0
 	github.com/joho/godotenv v1.5.1
-	github.com/livekit/protocol v1.46.6-0.20260605181725-7f0893ab5bf2
+	github.com/livekit/protocol v1.46.7-0.20260605212020-c0615a2f6f84
 	github.com/stretchr/testify v1.11.1
 	golang.org/x/oauth2 v0.36.0
 	google.golang.org/api v0.283.0
