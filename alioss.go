@@ -16,6 +16,7 @@ package storage
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"net/url"
 	"os"
@@ -24,6 +25,27 @@ import (
 
 	"github.com/aliyun/aliyun-oss-go-sdk/oss"
 )
+
+func wrapAliOSSError(err error) error {
+	if err == nil {
+		return nil
+	}
+	var svcErr oss.ServiceError
+	if errors.As(err, &svcErr) {
+		return &ErrorWithStatusCode{
+			Err:        err,
+			StatusCode: svcErr.StatusCode,
+		}
+	}
+	var unexpectedErr oss.UnexpectedStatusCodeError
+	if errors.As(err, &unexpectedErr) {
+		return &ErrorWithStatusCode{
+			Err:        err,
+			StatusCode: unexpectedErr.Got(),
+		}
+	}
+	return err
+}
 
 type aliOSSStorage struct {
 	conf   *AliOSSConfig
@@ -50,7 +72,7 @@ func NewAliOSS(conf *AliOSSConfig) (Storage, error) {
 func (s *aliOSSStorage) UploadData(data []byte, storagePath, contentType string) (string, int64, error) {
 	reader := bytes.NewBuffer(data)
 	if err := s.bucket.PutObject(storagePath, reader, oss.ContentType(contentType)); err != nil {
-		return "", 0, err
+		return "", 0, wrapAliOSSError(err)
 	}
 
 	return s.location(storagePath), int64(len(data)), nil
@@ -63,7 +85,7 @@ func (s *aliOSSStorage) UploadFile(filepath, storagePath, contentType string) (s
 	}
 
 	if err = s.bucket.PutObjectFromFile(storagePath, filepath, oss.ContentType(contentType)); err != nil {
-		return "", 0, err
+		return "", 0, wrapAliOSSError(err)
 	}
 
 	return s.location(storagePath), info.Size(), nil
@@ -82,7 +104,7 @@ func (s *aliOSSStorage) ListObjects(prefix string) ([]string, error) {
 	for {
 		lor, err := s.bucket.ListObjects(oss.Prefix(prefix), marker)
 		if err != nil {
-			return nil, err
+			return nil, wrapAliOSSError(err)
 		}
 
 		for _, object := range lor.Objects {
@@ -101,16 +123,20 @@ func (s *aliOSSStorage) ListObjects(prefix string) ([]string, error) {
 func (s *aliOSSStorage) DownloadData(storagePath string) ([]byte, error) {
 	reader, err := s.bucket.GetObject(storagePath)
 	if err != nil {
-		return nil, err
+		return nil, wrapAliOSSError(err)
 	}
 	defer reader.Close()
 
-	return io.ReadAll(reader)
+	data, err := io.ReadAll(reader)
+	if err != nil {
+		return nil, wrapAliOSSError(err)
+	}
+	return data, nil
 }
 
 func (s *aliOSSStorage) DownloadFile(filepath, storagePath string) (int64, error) {
 	if err := s.bucket.GetObjectToFile(storagePath, filepath); err != nil {
-		return 0, err
+		return 0, wrapAliOSSError(err)
 	}
 
 	info, err := os.Stat(filepath)
@@ -122,14 +148,18 @@ func (s *aliOSSStorage) DownloadFile(filepath, storagePath string) (int64, error
 }
 
 func (s *aliOSSStorage) GeneratePresignedUrl(storagePath string, expiration time.Duration) (string, error) {
-	return s.bucket.SignURL(storagePath, oss.HTTPGet, int64(expiration.Seconds()))
+	u, err := s.bucket.SignURL(storagePath, oss.HTTPGet, int64(expiration.Seconds()))
+	if err != nil {
+		return "", wrapAliOSSError(err)
+	}
+	return u, nil
 }
 
 func (s *aliOSSStorage) DeleteObject(storagePath string) error {
-	return s.bucket.DeleteObject(storagePath)
+	return wrapAliOSSError(s.bucket.DeleteObject(storagePath))
 }
 
 func (s *aliOSSStorage) DeleteObjects(storagePaths []string) error {
 	_, err := s.bucket.DeleteObjects(storagePaths)
-	return err
+	return wrapAliOSSError(err)
 }

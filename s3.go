@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -39,6 +40,20 @@ import (
 	"github.com/aws/smithy-go/logging"
 	"github.com/aws/smithy-go/middleware"
 )
+
+func wrapS3Error(err error) error {
+	if err == nil {
+		return nil
+	}
+	var sc interface{ HTTPStatusCode() int }
+	if errors.As(err, &sc) {
+		return &ErrorWithStatusCode{
+			Err:        err,
+			StatusCode: sc.HTTPStatusCode(),
+		}
+	}
+	return err
+}
 
 const defaultBucketLocation = "us-east-1"
 
@@ -150,7 +165,7 @@ func updateRegion(awsConf *aws.Config, bucket string) error {
 
 	resp, err := s3.NewFromConfig(*awsConf).GetBucketLocation(context.Background(), req)
 	if err != nil {
-		return err
+		return wrapS3Error(err)
 	}
 
 	if resp.LocationConstraint != "" {
@@ -257,7 +272,7 @@ func (s *s3Storage) upload(reader io.Reader, storagePath, contentType string) (s
 
 	if _, err := uploader.Upload(context.Background(), input); err != nil {
 		l.WriteLogs()
-		return "", err
+		return "", wrapS3Error(err)
 	}
 
 	return s.location(storagePath), nil
@@ -294,7 +309,7 @@ func (s *s3Storage) ListObjects(prefix string) ([]string, error) {
 	for paginator.HasMorePages() {
 		page, err := paginator.NextPage(context.Background())
 		if err != nil {
-			return nil, err
+			return nil, wrapS3Error(err)
 		}
 
 		for _, obj := range page.Contents {
@@ -328,7 +343,7 @@ func (s *s3Storage) DownloadFile(filepath, storagePath string) (int64, error) {
 func (s *s3Storage) download(w io.WriterAt, storagePath string) (int64, error) {
 	client := s.getClient(nil)
 
-	return manager.NewDownloader(client).Download(
+	n, err := manager.NewDownloader(client).Download(
 		context.Background(),
 		w,
 		&s3.GetObjectInput{
@@ -336,6 +351,7 @@ func (s *s3Storage) download(w io.WriterAt, storagePath string) (int64, error) {
 			Key:    aws.String(storagePath),
 		},
 	)
+	return n, wrapS3Error(err)
 }
 
 func (s *s3Storage) GeneratePresignedUrl(storagePath string, expiration time.Duration) (string, error) {
@@ -346,7 +362,7 @@ func (s *s3Storage) GeneratePresignedUrl(storagePath string, expiration time.Dur
 		Key:    aws.String(storagePath),
 	}, s3.WithPresignExpires(expiration))
 	if err != nil {
-		return "", err
+		return "", wrapS3Error(err)
 	}
 
 	return res.URL, nil
@@ -359,7 +375,7 @@ func (s *s3Storage) DeleteObject(storagePath string) error {
 		Bucket: aws.String(s.conf.Bucket),
 		Key:    aws.String(storagePath),
 	})
-	return err
+	return wrapS3Error(err)
 }
 
 func (s *s3Storage) DeleteObjects(storagePaths []string) error {
@@ -390,7 +406,7 @@ func (s *s3Storage) DeleteObjects(storagePaths []string) error {
 
 		_, err := client.DeleteObjects(context.Background(), deleteInput)
 		if err != nil {
-			return err
+			return wrapS3Error(err)
 		}
 	}
 

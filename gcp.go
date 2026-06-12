@@ -29,11 +29,32 @@ import (
 	"cloud.google.com/go/storage"
 	"github.com/googleapis/gax-go/v2"
 	"golang.org/x/oauth2/google"
+	"google.golang.org/api/googleapi"
 	"google.golang.org/api/iterator"
 	"google.golang.org/api/option"
 )
 
 const storageScope = "https://www.googleapis.com/auth/devstorage.read_write"
+
+func wrapGCPError(err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, storage.ErrBucketNotExist) || errors.Is(err, storage.ErrObjectNotExist) {
+		return &ErrorWithStatusCode{
+			Err:        err,
+			StatusCode: http.StatusNotFound,
+		}
+	}
+	var apiErr *googleapi.Error
+	if errors.As(err, &apiErr) {
+		return &ErrorWithStatusCode{
+			Err:        err,
+			StatusCode: apiErr.Code,
+		}
+	}
+	return err
+}
 
 type gcpStorage struct {
 	conf   *GCPConfig
@@ -111,11 +132,11 @@ func (s *gcpStorage) upload(reader io.Reader, storagePath, contentType string) (
 
 	n, err := io.Copy(wc, reader)
 	if err != nil {
-		return "", 0, err
+		return "", 0, wrapGCPError(err)
 	}
 
 	if err = wc.Close(); err != nil {
-		return "", 0, err
+		return "", 0, wrapGCPError(err)
 	}
 
 	return s.location(storagePath), n, nil
@@ -141,7 +162,7 @@ func (s *gcpStorage) ListObjects(prefix string) ([]string, error) {
 			if errors.Is(err, iterator.Done) {
 				return objects, nil
 			}
-			return nil, err
+			return nil, wrapGCPError(err)
 		}
 		objects = append(objects, attr.Name)
 	}
@@ -154,7 +175,11 @@ func (s *gcpStorage) DownloadData(storagePath string) ([]byte, error) {
 	}
 	defer rc.Close()
 
-	return io.ReadAll(rc)
+	data, err := io.ReadAll(rc)
+	if err != nil {
+		return nil, wrapGCPError(err)
+	}
+	return data, nil
 }
 
 func (s *gcpStorage) DownloadFile(filepath, storagePath string) (int64, error) {
@@ -172,14 +197,14 @@ func (s *gcpStorage) DownloadFile(filepath, storagePath string) (int64, error) {
 	_, err = io.Copy(file, rc)
 	_ = rc.Close()
 	if err != nil {
-		return 0, err
+		return 0, wrapGCPError(err)
 	}
 
 	return rc.Attrs.Size, nil
 }
 
 func (s *gcpStorage) download(storagePath string) (*storage.Reader, error) {
-	return s.client.Bucket(s.conf.Bucket).Object(storagePath).Retryer(
+	r, err := s.client.Bucket(s.conf.Bucket).Object(storagePath).Retryer(
 		storage.WithBackoff(
 			gax.Backoff{
 				Initial:    time.Millisecond * 100,
@@ -188,24 +213,32 @@ func (s *gcpStorage) download(storagePath string) (*storage.Reader, error) {
 			}),
 		storage.WithPolicy(storage.RetryAlways),
 	).NewReader(context.Background())
+	if err != nil {
+		return nil, wrapGCPError(err)
+	}
+	return r, nil
 }
 
 func (s *gcpStorage) GeneratePresignedUrl(storagePath string, expiration time.Duration) (string, error) {
-	return s.client.Bucket(s.conf.Bucket).SignedURL(storagePath, &storage.SignedURLOptions{
+	u, err := s.client.Bucket(s.conf.Bucket).SignedURL(storagePath, &storage.SignedURLOptions{
 		Method:  "GET",
 		Expires: time.Now().Add(expiration),
 	})
+	if err != nil {
+		return "", wrapGCPError(err)
+	}
+	return u, nil
 }
 
 func (s *gcpStorage) DeleteObject(storagePath string) error {
-	return s.client.Bucket(s.conf.Bucket).Object(storagePath).Delete(context.Background())
+	return wrapGCPError(s.client.Bucket(s.conf.Bucket).Object(storagePath).Delete(context.Background()))
 }
 
 func (s *gcpStorage) DeleteObjects(storagePaths []string) error {
 	bucket := s.client.Bucket(s.conf.Bucket)
 	for _, path := range storagePaths {
 		if err := bucket.Object(path).Delete(context.Background()); err != nil {
-			return err
+			return wrapGCPError(err)
 		}
 	}
 	return nil
