@@ -44,6 +44,36 @@ func requireStatus(t *testing.T, err error, wantStatus int, wantInner error) {
 	require.ErrorIs(t, sce.Err, wantInner)
 }
 
+type customError struct{ msg string }
+
+func (c *customError) Error() string { return c.msg }
+
+func TestErrorWithStatusCodeUnwrap(t *testing.T) {
+	sentinel := errors.New("sentinel")
+	err := &ErrorWithStatusCode{Err: sentinel, StatusCode: 418}
+
+	t.Run("errors.Is finds wrapped sentinel", func(t *testing.T) {
+		require.ErrorIs(t, err, sentinel)
+	})
+
+	t.Run("errors.Is through fmt.Errorf wrap", func(t *testing.T) {
+		wrapped := fmt.Errorf("outer: %w", err)
+		require.ErrorIs(t, wrapped, sentinel)
+	})
+
+	t.Run("errors.As extracts inner error type", func(t *testing.T) {
+		inner := &customError{msg: "boom"}
+		wrapped := &ErrorWithStatusCode{Err: inner, StatusCode: 500}
+		var ce *customError
+		require.ErrorAs(t, wrapped, &ce)
+		require.Same(t, inner, ce)
+	})
+
+	t.Run("Unwrap returns inner error", func(t *testing.T) {
+		require.Same(t, sentinel, errors.Unwrap(err))
+	})
+}
+
 func TestWrapS3Error(t *testing.T) {
 	t.Run("nil", func(t *testing.T) {
 		require.NoError(t, wrapS3Error(nil))

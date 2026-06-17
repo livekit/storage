@@ -13,6 +13,6 @@ func (e *ErrorWithStatusCode) Error() string {
 	return fmt.Sprintf("Err: %s, Status Code: %d", e.Err, e.StatusCode)
 }
 
-func (e *ErrorWithStatusCode) UnWrap() error {
+func (e *ErrorWithStatusCode) Unwrap() error {
 	return e.Err
 }
