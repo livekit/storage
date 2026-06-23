@@ -23,12 +23,27 @@ import (
 	"path"
 	"time"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blob"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/sas"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/service"
 )
+
+func wrapAzureError(err error) error {
+	if err == nil {
+		return nil
+	}
+	var respErr *azcore.ResponseError
+	if errors.As(err, &respErr) {
+		return &ErrorWithStatusCode{
+			Err:        err,
+			StatusCode: respErr.StatusCode,
+		}
+	}
+	return err
+}
 
 const azureBlockSize = 4 * 1024 * 1024
 const azureParallelism = 16
@@ -73,7 +88,7 @@ func (s *azureBLOBStorage) UploadData(data []byte, storagePath, contentType stri
 		Concurrency: azureParallelism,
 	})
 	if err != nil {
-		return "", 0, err
+		return "", 0, wrapAzureError(err)
 	}
 	return s.location(storagePath), int64(len(data)), nil
 }
@@ -98,7 +113,7 @@ func (s *azureBLOBStorage) UploadFile(filepath, storagePath, contentType string)
 		Concurrency: azureParallelism,
 	})
 	if err != nil {
-		return "", 0, err
+		return "", 0, wrapAzureError(err)
 	}
 
 	return s.location(storagePath), stat.Size(), nil
@@ -113,7 +128,7 @@ func (s *azureBLOBStorage) ListObjects(prefix string) ([]string, error) {
 	for pager.More() {
 		page, err := pager.NextPage(context.Background())
 		if err != nil {
-			return nil, err
+			return nil, wrapAzureError(err)
 		}
 		for _, item := range page.Segment.BlobItems {
 			if item.Name != nil {
@@ -131,7 +146,7 @@ func (s *azureBLOBStorage) DownloadData(storagePath string) ([]byte, error) {
 
 	props, err := blobClient.GetProperties(ctx, nil)
 	if err != nil {
-		return nil, err
+		return nil, wrapAzureError(err)
 	}
 	if props.ContentLength == nil {
 		return nil, errors.New("azure: missing content length")
@@ -143,7 +158,7 @@ func (s *azureBLOBStorage) DownloadData(storagePath string) ([]byte, error) {
 		Concurrency: azureParallelism,
 	})
 	if err != nil {
-		return nil, err
+		return nil, wrapAzureError(err)
 	}
 	return buf, nil
 }
@@ -160,7 +175,7 @@ func (s *azureBLOBStorage) DownloadFile(filepath, storagePath string) (int64, er
 		Concurrency: azureParallelism,
 	})
 	if err != nil {
-		return 0, err
+		return 0, wrapAzureError(err)
 	}
 
 	stat, err := file.Stat()
@@ -188,7 +203,7 @@ func (s *azureBLOBStorage) GeneratePresignedUrl(storagePath string, expiration t
 		Expiry: to.Ptr(exp.Format(sas.TimeFormat)),
 	}, nil)
 	if err != nil {
-		return "", err
+		return "", wrapAzureError(err)
 	}
 
 	qp, err := sas.BlobSignatureValues{
@@ -214,7 +229,7 @@ func (s *azureBLOBStorage) GeneratePresignedUrl(storagePath string, expiration t
 
 func (s *azureBLOBStorage) DeleteObject(storagePath string) error {
 	_, err := s.client.DeleteBlob(context.Background(), s.conf.ContainerName, storagePath, nil)
-	return err
+	return wrapAzureError(err)
 }
 
 func (s *azureBLOBStorage) DeleteObjects(storagePaths []string) error {
