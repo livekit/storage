@@ -24,7 +24,7 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
-	"github.com/aliyun/aliyun-oss-go-sdk/oss"
+	"github.com/aliyun/alibabacloud-oss-go-sdk-v2/oss"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/api/googleapi"
 )
@@ -173,24 +173,16 @@ func TestWrapAliOSSError(t *testing.T) {
 	})
 
 	t.Run("ServiceError", func(t *testing.T) {
-		inner := oss.ServiceError{StatusCode: 403, Code: "AccessDenied", Message: "denied"}
+		inner := &oss.ServiceError{StatusCode: 403, Code: "AccessDenied", Message: "denied"}
 		requireStatus(t, wrapAliOSSError(inner), 403, inner)
 	})
 
 	t.Run("wrapped ServiceError", func(t *testing.T) {
-		inner := oss.ServiceError{StatusCode: 404, Code: "NoSuchKey"}
+		inner := &oss.ServiceError{StatusCode: 404, Code: "NoSuchKey"}
 		wrapped := fmt.Errorf("get: %w", inner)
 		requireStatus(t, wrapAliOSSError(wrapped), 404, inner)
 	})
 
-	t.Run("UnexpectedStatusCodeError", func(t *testing.T) {
-		// CheckRespCode returns an UnexpectedStatusCodeError when respCode is not in allowed.
-		inner := oss.CheckRespCode(500, []int{200})
-		require.Error(t, inner)
-		var sce *ErrorWithStatusCode
-		require.ErrorAs(t, wrapAliOSSError(inner), &sce)
-		require.Equal(t, 500, sce.StatusCode)
-	})
 
 	t.Run("plain error passes through", func(t *testing.T) {
 		plain := errors.New("eof")

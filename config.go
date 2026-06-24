@@ -27,6 +27,7 @@ type Config interface {
 type AliOSSConfig struct {
 	AccessKey string `yaml:"access_key,omitempty"`
 	Secret    string `yaml:"secret,omitempty"`
+	Region    string `yaml:"region,omitempty"` // optional; derived from endpoint when empty
 	Endpoint  string `yaml:"endpoint,omitempty"`
 	Bucket    string `yaml:"bucket,omitempty"`
 }
