@@ -54,13 +54,31 @@ type azureBLOBStorage struct {
 	serviceUrl string
 }
 
+// serviceURL returns the base blob service URL for the account. A custom
+// Endpoint (an Azurite emulator or a sovereign cloud such as
+// *.blob.core.chinacloudapi.cn) overrides the default global-cloud host.
+func (c *AzureConfig) serviceURL() (*url.URL, error) {
+	if c.Endpoint != "" {
+		return url.Parse(c.Endpoint)
+	}
+	return &url.URL{
+		Scheme: "https",
+		Host:   fmt.Sprintf("%s.blob.core.windows.net", c.AccountName),
+	}, nil
+}
+
 func NewAzure(conf *AzureConfig) (Storage, error) {
 	cred, err := azblob.NewSharedKeyCredential(conf.AccountName, conf.AccountKey)
 	if err != nil {
 		return nil, err
 	}
 
-	serviceUrl := fmt.Sprintf("https://%s.blob.core.windows.net/", conf.AccountName)
+	base, err := conf.serviceURL()
+	if err != nil {
+		return nil, err
+	}
+	serviceUrl := base.String()
+
 	client, err := azblob.NewClientWithSharedKeyCredential(serviceUrl, cred, nil)
 	if err != nil {
 		return nil, err
@@ -74,11 +92,12 @@ func NewAzure(conf *AzureConfig) (Storage, error) {
 }
 
 func (s *azureBLOBStorage) location(storagePath string) string {
-	return (&url.URL{
-		Scheme: "https",
-		Host:   fmt.Sprintf("%s.blob.core.windows.net", s.conf.AccountName),
-		Path:   path.Join(s.conf.ContainerName, storagePath),
-	}).String()
+	u, err := s.conf.serviceURL()
+	if err != nil {
+		return ""
+	}
+	u.Path = path.Join(u.Path, s.conf.ContainerName, storagePath)
+	return u.String()
 }
 
 func (s *azureBLOBStorage) UploadData(data []byte, storagePath, contentType string) (string, int64, error) {
@@ -218,12 +237,12 @@ func (s *azureBLOBStorage) GeneratePresignedUrl(storagePath string, expiration t
 		return "", err
 	}
 
-	loc := &url.URL{
-		Scheme:   "https",
-		Host:     fmt.Sprintf("%s.blob.core.windows.net", s.conf.AccountName),
-		Path:     path.Join(s.conf.ContainerName, storagePath),
-		RawQuery: qp.Encode(),
+	loc, err := s.conf.serviceURL()
+	if err != nil {
+		return "", err
 	}
+	loc.Path = path.Join(loc.Path, s.conf.ContainerName, storagePath)
+	loc.RawQuery = qp.Encode()
 	return loc.String(), nil
 }
 
