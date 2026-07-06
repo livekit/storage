@@ -37,7 +37,8 @@ type AzureConfig struct {
 	AccountName     string                 `yaml:"account_name,omitempty"` // (env AZURE_STORAGE_ACCOUNT)
 	AccountKey      string                 `yaml:"account_key,omitempty"`  // (env AZURE_STORAGE_KEY)
 	ContainerName   string                 `yaml:"container_name,omitempty"`
-	TokenCredential azcore.TokenCredential `yaml:"-"` // required for presigned url generation
+	Endpoint        string                 `yaml:"endpoint,omitempty"` // blob service URL; overrides the default https://<account>.blob.core.windows.net (e.g. an Azurite emulator or a sovereign cloud like *.blob.core.chinacloudapi.cn)
+	TokenCredential azcore.TokenCredential `yaml:"-"`                  // required for presigned url generation
 }
 
 func (c *AzureConfig) newStorage() (Storage, error) { return NewAzure(c) }

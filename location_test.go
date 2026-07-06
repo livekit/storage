@@ -143,6 +143,38 @@ func TestAzureLocation(t *testing.T) {
 	}
 }
 
+func TestAzureLocationCustomEndpoint(t *testing.T) {
+	cases := []struct {
+		name        string
+		conf        AzureConfig
+		storagePath string
+		want        string
+	}{
+		{
+			name:        "azurite emulator preserves scheme and account path",
+			conf:        AzureConfig{AccountName: "devstoreaccount1", ContainerName: "mycontainer", Endpoint: "http://127.0.0.1:10000/devstoreaccount1"},
+			storagePath: "foo.mp4",
+			want:        "http://127.0.0.1:10000/devstoreaccount1/mycontainer/foo.mp4",
+		},
+		{
+			name:        "azurite emulator nested path",
+			conf:        AzureConfig{AccountName: "devstoreaccount1", ContainerName: "mycontainer", Endpoint: "http://127.0.0.1:10000/devstoreaccount1"},
+			storagePath: "a/b/c.mp4",
+			want:        "http://127.0.0.1:10000/devstoreaccount1/mycontainer/a/b/c.mp4",
+		},
+		{
+			name:        "sovereign cloud host",
+			conf:        AzureConfig{AccountName: "acct", ContainerName: "mycontainer", Endpoint: "https://acct.blob.core.chinacloudapi.cn"},
+			storagePath: "foo.mp4",
+			want:        "https://acct.blob.core.chinacloudapi.cn/mycontainer/foo.mp4",
+		},
+	}
+	for _, tc := range cases {
+		s := &azureBLOBStorage{conf: &tc.conf}
+		require.Equal(t, tc.want, s.location(tc.storagePath), tc.name)
+	}
+}
+
 func TestGCPLocation(t *testing.T) {
 	cases := []struct {
 		name        string
