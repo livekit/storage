@@ -32,5 +32,5 @@ type Storage interface {
 }
 
 func New(conf Config) (Storage, error) {
-	return conf.newStorage()
+	return newStorage(conf)
 }
