@@ -15,72 +15,37 @@
 package storage
 
 import (
-	"time"
+	"fmt"
 
-	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+	"github.com/livekit/storage/config"
 )
 
-type Config interface {
-	newStorage() (Storage, error)
-}
+// The config structs live in the storage/config package so that consumers which
+// only embed them in their own config (and never create a Storage) don't pull
+// in every provider SDK. These aliases keep the existing API.
+type (
+	Config       = config.Config
+	AliOSSConfig = config.AliOSSConfig
+	AzureConfig  = config.AzureConfig
+	GCPConfig    = config.GCPConfig
+	LocalConfig  = config.LocalConfig
+	S3Config     = config.S3Config
+	ProxyConfig  = config.ProxyConfig
+)
 
-type AliOSSConfig struct {
-	AccessKey string `yaml:"access_key,omitempty"`
-	Secret    string `yaml:"secret,omitempty"`
-	Endpoint  string `yaml:"endpoint,omitempty"`
-	Bucket    string `yaml:"bucket,omitempty"`
-}
-
-func (c *AliOSSConfig) newStorage() (Storage, error) { return NewAliOSS(c) }
-
-type AzureConfig struct {
-	AccountName     string                 `yaml:"account_name,omitempty"` // (env AZURE_STORAGE_ACCOUNT)
-	AccountKey      string                 `yaml:"account_key,omitempty"`  // (env AZURE_STORAGE_KEY)
-	ContainerName   string                 `yaml:"container_name,omitempty"`
-	TokenCredential azcore.TokenCredential `yaml:"-"` // required for presigned url generation
-}
-
-func (c *AzureConfig) newStorage() (Storage, error) { return NewAzure(c) }
-
-type GCPConfig struct {
-	CredentialsJSON string       `yaml:"credentials_json,omitempty"` // (env GOOGLE_APPLICATION_CREDENTIALS)
-	Bucket          string       `yaml:"bucket,omitempty"`
-	ProxyConfig     *ProxyConfig `yaml:"proxy_config,omitempty"`
-}
-
-func (c *GCPConfig) newStorage() (Storage, error) { return NewGCP(c) }
-
-type LocalConfig struct {
-	StorageDir string `yaml:"storage_dir,omitempty"`
-}
-
-func (c *LocalConfig) newStorage() (Storage, error) { return NewLocal(c) }
-
-type S3Config struct {
-	AccessKey            string       `yaml:"access_key,omitempty"`
-	Secret               string       `yaml:"secret,omitempty"`
-	SessionToken         string       `yaml:"session_token,omitempty"`
-	AssumeRoleArn        string       `yaml:"assume_role_arn,omitempty"`         // ARN of the role to assume for file upload. Egress will make an AssumeRole API call using the provided access_key and secret to assume that role
-	AssumeRoleExternalId string       `yaml:"assume_role_external_id,omitempty"` // ExternalID to use when assuming role for upload
-	Region               string       `yaml:"region,omitempty"`
-	Endpoint             string       `yaml:"endpoint,omitempty"`
-	Bucket               string       `yaml:"bucket,omitempty"`
-	ForcePathStyle       bool         `yaml:"force_path_style,omitempty"`
-	ProxyConfig          *ProxyConfig `yaml:"proxy_config,omitempty"`
-
-	MaxRetries    int           `yaml:"max_retries,omitempty"`
-	MaxRetryDelay time.Duration `yaml:"max_retry_delay,omitempty"`
-	MinRetryDelay time.Duration `yaml:"min_retry_delay,omitempty"`
-
-	Metadata           map[string]string `yaml:"metadata,omitempty"`
-	Tagging            string            `yaml:"tagging,omitempty"`
-	ContentDisposition string            `yaml:"content_disposition,omitempty"`
-}
-
-func (c *S3Config) newStorage() (Storage, error) { return NewS3(c) }
-
-type ProxyConfig struct {
-	Url      string `yaml:"url,omitempty"`
-	Username string `yaml:"username,omitempty"`
-	Password string `yaml:"password,omitempty"`
+func newStorage(conf Config) (Storage, error) {
+	switch c := conf.(type) {
+	case *AliOSSConfig:
+		return NewAliOSS(c)
+	case *AzureConfig:
+		return NewAzure(c)
+	case *GCPConfig:
+		return NewGCP(c)
+	case *LocalConfig:
+		return NewLocal(c)
+	case *S3Config:
+		return NewS3(c)
+	default:
+		return nil, fmt.Errorf("unsupported storage config type %T", conf)
+	}
 }
