@@ -14,7 +14,35 @@
 
 package storage
 
-import "time"
+import (
+	"context"
+	"errors"
+	"time"
+)
+
+// Errors a backend maps its own to, so callers can decide with errors.Is
+// whether an object was missing or a conditional upload lost. They come
+// wrapped in the backend's error, which keeps the status code and message.
+var (
+	ErrNotFound     = errors.New("storage: object not found")
+	ErrObjectExists = errors.New("storage: object already exists")
+)
+
+// ConditionalUploader is a Storage whose uploads can be made conditional on
+// the object not existing. Two writers racing for one path see exactly one
+// succeed; the other gets ErrObjectExists and changes nothing. S3 and local
+// storage implement it.
+type ConditionalUploader interface {
+	UploadDataIfAbsent(ctx context.Context, data []byte, storagePath, contentType string) (location string, size int64, err error)
+	UploadFileIfAbsent(ctx context.Context, filepath, storagePath, contentType string) (location string, size int64, err error)
+}
+
+// RangeDownloader is a Storage that can read part of an object: n bytes from
+// offset off, fewer at the end of the object. An offset past the end, or a
+// missing object, is ErrNotFound. S3 and local storage implement it.
+type RangeDownloader interface {
+	DownloadRange(ctx context.Context, storagePath string, off, n int64) ([]byte, error)
+}
 
 type Storage interface {
 	UploadData(data []byte, storagePath, contentType string) (location string, size int64, err error)

@@ -47,12 +47,84 @@ func wrapS3Error(err error) error {
 	}
 	var sc interface{ HTTPStatusCode() int }
 	if errors.As(err, &sc) {
+		code := sc.HTTPStatusCode()
+		// The two outcomes callers decide on carry a sentinel as well as
+		// the status, so errors.Is works without knowing S3's codes.
+		switch code {
+		case http.StatusNotFound:
+			err = fmt.Errorf("%w: %w", ErrNotFound, err)
+		case http.StatusPreconditionFailed:
+			err = fmt.Errorf("%w: %w", ErrObjectExists, err)
+		}
 		return &ErrorWithStatusCode{
 			Err:        err,
-			StatusCode: sc.HTTPStatusCode(),
+			StatusCode: code,
 		}
 	}
 	return err
+}
+
+var (
+	_ ConditionalUploader = (*s3Storage)(nil)
+	_ RangeDownloader     = (*s3Storage)(nil)
+)
+
+// UploadDataIfAbsent stores data at storagePath unless an object is there,
+// with S3's If-None-Match condition, so the check and the write are one
+// request.
+func (s *s3Storage) UploadDataIfAbsent(ctx context.Context, data []byte, storagePath, contentType string) (string, int64, error) {
+	loc, err := s.uploadWith(ctx, bytes.NewReader(data), storagePath, contentType, true)
+	if err != nil {
+		return "", 0, err
+	}
+	return loc, int64(len(data)), nil
+}
+
+// UploadFileIfAbsent stores the file at filepath at storagePath unless an
+// object is there. The condition rides the multipart completion, so a large
+// upload is as atomic as a small one.
+func (s *s3Storage) UploadFileIfAbsent(ctx context.Context, filepath, storagePath, contentType string) (string, int64, error) {
+	file, err := os.Open(filepath)
+	if err != nil {
+		return "", 0, err
+	}
+	defer file.Close()
+	stat, err := file.Stat()
+	if err != nil {
+		return "", 0, err
+	}
+	loc, err := s.uploadWith(ctx, file, storagePath, contentType, true)
+	if err != nil {
+		return "", 0, err
+	}
+	return loc, stat.Size(), nil
+}
+
+// DownloadRange reads n bytes from offset off with a Range request. S3
+// answers a start past the end with 416, which is ErrNotFound here.
+func (s *s3Storage) DownloadRange(ctx context.Context, storagePath string, off, n int64) ([]byte, error) {
+	if off < 0 || n <= 0 {
+		return nil, fmt.Errorf("storage: invalid range %d+%d", off, n)
+	}
+	client := s.getClient(nil)
+	out, err := client.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(s.conf.Bucket),
+		Key:    aws.String(storagePath),
+		Range:  aws.String(fmt.Sprintf("bytes=%d-%d", off, off+n-1)),
+	})
+	if err != nil {
+		var sc interface{ HTTPStatusCode() int }
+		if errors.As(err, &sc) && sc.HTTPStatusCode() == http.StatusRequestedRangeNotSatisfiable {
+			return nil, &ErrorWithStatusCode{Err: fmt.Errorf("%w: range %d+%d past the end: %w", ErrNotFound, off, n, err), StatusCode: http.StatusRequestedRangeNotSatisfiable}
+		}
+		return nil, wrapS3Error(err)
+	}
+	defer out.Body.Close()
+	data, err := io.ReadAll(io.LimitReader(out.Body, n))
+	if err != nil {
+		return nil, err
+	}
+	return data, nil
 }
 
 const defaultBucketLocation = "us-east-1"
@@ -223,6 +295,12 @@ func (s *s3Storage) UploadFile(filepath, storagePath, contentType string) (strin
 }
 
 func (s *s3Storage) upload(reader io.Reader, storagePath, contentType string) (string, error) {
+	return s.uploadWith(context.Background(), reader, storagePath, contentType, false)
+}
+
+// uploadWith is the one upload path: ifAbsent adds If-None-Match: * so the
+// object is written only when none is there.
+func (s *s3Storage) uploadWith(ctx context.Context, reader io.Reader, storagePath, contentType string, ifAbsent bool) (string, error) {
 	l := NewS3Logger()
 	client := s.getClient(l)
 
@@ -232,6 +310,9 @@ func (s *s3Storage) upload(reader io.Reader, storagePath, contentType string) (s
 		ContentType: aws.String(contentType),
 		Key:         aws.String(storagePath),
 		Metadata:    s.conf.Metadata,
+	}
+	if ifAbsent {
+		input.IfNoneMatch = aws.String("*")
 	}
 	if s.conf.Tagging != "" {
 		input.Tagging = &s.conf.Tagging
@@ -270,8 +351,10 @@ func (s *s3Storage) upload(reader io.Reader, storagePath, contentType string) (s
 		}
 	})
 
-	if _, err := uploader.Upload(context.Background(), input); err != nil {
-		l.WriteLogs()
+	if _, err := uploader.Upload(ctx, input); err != nil {
+		if !errors.Is(wrapS3Error(err), ErrObjectExists) {
+			l.WriteLogs()
+		}
 		return "", wrapS3Error(err)
 	}
 
