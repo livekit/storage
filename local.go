@@ -15,6 +15,9 @@
 package storage
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"io"
 	"net/url"
 	"os"
@@ -89,6 +92,82 @@ func (u *localUploader) UploadData(data []byte, storagePath, _ string) (string, 
 	}
 
 	return storagePath, int64(size), nil
+}
+
+var (
+	_ ConditionalUploader = (*localUploader)(nil)
+	_ RangeDownloader     = (*localUploader)(nil)
+)
+
+// createIfAbsent opens the destination for exclusive creation, which is the
+// filesystem's own atomic check-and-create.
+func (u *localUploader) createIfAbsent(storagePath string) (*os.File, error) {
+	if dir, _ := path.Split(storagePath); dir != "" {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return nil, err
+		}
+	}
+	f, err := os.OpenFile(storagePath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0644)
+	if errors.Is(err, os.ErrExist) {
+		return nil, fmt.Errorf("%w: %s", ErrObjectExists, storagePath)
+	}
+	return f, err
+}
+
+func (u *localUploader) UploadDataIfAbsent(_ context.Context, data []byte, storagePath, _ string) (string, int64, error) {
+	storagePath = u.location(storagePath)
+	f, err := u.createIfAbsent(storagePath)
+	if err != nil {
+		return "", 0, err
+	}
+	defer f.Close()
+	size, err := f.Write(data)
+	if err != nil {
+		return "", 0, err
+	}
+	return storagePath, int64(size), nil
+}
+
+func (u *localUploader) UploadFileIfAbsent(_ context.Context, localPath, storagePath, _ string) (string, int64, error) {
+	storagePath = u.location(storagePath)
+	local, err := os.Open(localPath)
+	if err != nil {
+		return "", 0, err
+	}
+	defer local.Close()
+	f, err := u.createIfAbsent(storagePath)
+	if err != nil {
+		return "", 0, err
+	}
+	defer f.Close()
+	size, err := io.Copy(f, local)
+	if err != nil {
+		return "", 0, err
+	}
+	return storagePath, size, nil
+}
+
+func (u *localUploader) DownloadRange(_ context.Context, storagePath string, off, n int64) ([]byte, error) {
+	if off < 0 || n <= 0 {
+		return nil, fmt.Errorf("storage: invalid range %d+%d", off, n)
+	}
+	f, err := os.Open(path.Join(u.StorageDir, storagePath))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("%w: %s", ErrNotFound, storagePath)
+		}
+		return nil, err
+	}
+	defer f.Close()
+	buf := make([]byte, n)
+	read, err := f.ReadAt(buf, off)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return nil, err
+	}
+	if read == 0 {
+		return nil, fmt.Errorf("%w: range %d+%d past the end of %s", ErrNotFound, off, n, storagePath)
+	}
+	return buf[:read], nil
 }
 
 func (u *localUploader) location(storagePath string) string {
