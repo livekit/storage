@@ -18,6 +18,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
 	"net/url"
 	"os"
 	"path"
@@ -27,6 +29,7 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blob"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/bloberror"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/sas"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/service"
 )
@@ -37,12 +40,81 @@ func wrapAzureError(err error) error {
 	}
 	var respErr *azcore.ResponseError
 	if errors.As(err, &respErr) {
+		switch {
+		case respErr.StatusCode == http.StatusNotFound:
+			err = fmt.Errorf("%w: %w", ErrNotFound, err)
+		case bloberror.HasCode(err, bloberror.BlobAlreadyExists):
+			err = fmt.Errorf("%w: %w", ErrObjectExists, err)
+		}
 		return &ErrorWithStatusCode{
 			Err:        err,
 			StatusCode: respErr.StatusCode,
 		}
 	}
 	return err
+}
+
+// ifNoneMatchAny is the access condition that refuses the write when a blob
+// is there: Azure answers 409 BlobAlreadyExists.
+func ifNoneMatchAny() *blob.AccessConditions {
+	return &blob.AccessConditions{ModifiedAccessConditions: &blob.ModifiedAccessConditions{IfNoneMatch: to.Ptr(azcore.ETagAny)}}
+}
+
+func (s *azureBLOBStorage) UploadDataIfAbsent(ctx context.Context, data []byte, storagePath, contentType string) (string, int64, error) {
+	_, err := s.client.UploadBuffer(ctx, s.conf.ContainerName, storagePath, data, &azblob.UploadBufferOptions{
+		HTTPHeaders:      &blob.HTTPHeaders{BlobContentType: &contentType},
+		BlockSize:        azureBlockSize,
+		Concurrency:      azureParallelism,
+		AccessConditions: ifNoneMatchAny(),
+	})
+	if err != nil {
+		return "", 0, wrapAzureError(err)
+	}
+	return s.location(storagePath), int64(len(data)), nil
+}
+
+func (s *azureBLOBStorage) UploadFileIfAbsent(ctx context.Context, filepath, storagePath, contentType string) (string, int64, error) {
+	file, err := os.Open(filepath)
+	if err != nil {
+		return "", 0, err
+	}
+	defer file.Close()
+	stat, err := file.Stat()
+	if err != nil {
+		return "", 0, err
+	}
+	_, err = s.client.UploadFile(ctx, s.conf.ContainerName, storagePath, file, &azblob.UploadFileOptions{
+		HTTPHeaders:      &blob.HTTPHeaders{BlobContentType: &contentType},
+		BlockSize:        azureBlockSize,
+		Concurrency:      azureParallelism,
+		AccessConditions: ifNoneMatchAny(),
+	})
+	if err != nil {
+		return "", 0, wrapAzureError(err)
+	}
+	return s.location(storagePath), stat.Size(), nil
+}
+
+func (s *azureBLOBStorage) DownloadRange(ctx context.Context, storagePath string, off, n int64) ([]byte, error) {
+	if off < 0 || n <= 0 {
+		return nil, fmt.Errorf("storage: invalid range %d+%d", off, n)
+	}
+	resp, err := s.client.DownloadStream(ctx, s.conf.ContainerName, storagePath, &azblob.DownloadStreamOptions{
+		Range: blob.HTTPRange{Offset: off, Count: n},
+	})
+	if err != nil {
+		var respErr *azcore.ResponseError
+		if errors.As(err, &respErr) && respErr.StatusCode == http.StatusRequestedRangeNotSatisfiable {
+			return nil, &ErrorWithStatusCode{Err: fmt.Errorf("%w: range %d+%d past the end: %w", ErrNotFound, off, n, err), StatusCode: respErr.StatusCode}
+		}
+		return nil, wrapAzureError(err)
+	}
+	defer resp.Body.Close()
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, wrapAzureError(err)
+	}
+	return data, nil
 }
 
 const azureBlockSize = 4 * 1024 * 1024

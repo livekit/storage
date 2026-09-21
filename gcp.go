@@ -42,18 +42,91 @@ func wrapGCPError(err error) error {
 	}
 	if errors.Is(err, storage.ErrBucketNotExist) || errors.Is(err, storage.ErrObjectNotExist) {
 		return &ErrorWithStatusCode{
-			Err:        err,
+			Err:        fmt.Errorf("%w: %w", ErrNotFound, err),
 			StatusCode: http.StatusNotFound,
 		}
 	}
 	var apiErr *googleapi.Error
 	if errors.As(err, &apiErr) {
+		switch apiErr.Code {
+		case http.StatusNotFound:
+			err = fmt.Errorf("%w: %w", ErrNotFound, err)
+		case http.StatusPreconditionFailed:
+			err = fmt.Errorf("%w: %w", ErrObjectExists, err)
+		}
 		return &ErrorWithStatusCode{
 			Err:        err,
 			StatusCode: apiErr.Code,
 		}
 	}
 	return err
+}
+
+// gcsObjectNotFound is the not-found the client library reports as a
+// sentinel rather than a status.
+func gcsObjectNotFound(err error) error {
+	return &ErrorWithStatusCode{Err: fmt.Errorf("%w: %w", ErrNotFound, err), StatusCode: http.StatusNotFound}
+}
+
+func (s *gcpStorage) UploadDataIfAbsent(ctx context.Context, data []byte, storagePath, contentType string) (string, int64, error) {
+	return s.uploadIfAbsent(ctx, bytes.NewReader(data), storagePath, contentType)
+}
+
+func (s *gcpStorage) UploadFileIfAbsent(ctx context.Context, filepath, storagePath, contentType string) (string, int64, error) {
+	file, err := os.Open(filepath)
+	if err != nil {
+		return "", 0, err
+	}
+	defer file.Close()
+	return s.uploadIfAbsent(ctx, file, storagePath, contentType)
+}
+
+// uploadIfAbsent writes under a DoesNotExist precondition: GCS refuses the
+// write with 412 when an object is there.
+func (s *gcpStorage) uploadIfAbsent(ctx context.Context, reader io.Reader, storagePath, contentType string) (string, int64, error) {
+	wc := s.client.Bucket(s.conf.Bucket).Object(storagePath).
+		If(storage.Conditions{DoesNotExist: true}).
+		Retryer(
+			storage.WithBackoff(gax.Backoff{Initial: time.Millisecond * 100, Max: time.Second * 5, Multiplier: 2}),
+			storage.WithMaxAttempts(5),
+			storage.WithPolicy(storage.RetryAlways),
+		).NewWriter(ctx)
+	wc.ContentType = contentType
+	wc.ChunkRetryDeadline = 0
+	n, err := io.Copy(wc, reader)
+	if err != nil {
+		return "", 0, wrapGCPError(err)
+	}
+	if err = wc.Close(); err != nil {
+		return "", 0, wrapGCPError(err)
+	}
+	return s.location(storagePath), n, nil
+}
+
+func (s *gcpStorage) DownloadRange(ctx context.Context, storagePath string, off, n int64) ([]byte, error) {
+	if off < 0 || n <= 0 {
+		return nil, fmt.Errorf("storage: invalid range %d+%d", off, n)
+	}
+	r, err := s.client.Bucket(s.conf.Bucket).Object(storagePath).Retryer(
+		storage.WithBackoff(gax.Backoff{Initial: time.Millisecond * 100, Max: time.Second * 5, Multiplier: 2}),
+		storage.WithPolicy(storage.RetryAlways),
+	).NewRangeReader(ctx, off, n)
+	if err != nil {
+		if errors.Is(err, storage.ErrObjectNotExist) {
+			return nil, gcsObjectNotFound(err)
+		}
+		var apiErr *googleapi.Error
+		if errors.As(err, &apiErr) && apiErr.Code == http.StatusRequestedRangeNotSatisfiable {
+			return nil, &ErrorWithStatusCode{Err: fmt.Errorf("%w: range %d+%d past the end: %w", ErrNotFound, off, n, err), StatusCode: apiErr.Code}
+		}
+		return nil, wrapGCPError(err)
+	}
+	defer r.Close()
+	data, err := io.ReadAll(r)
+	if err != nil {
+		return nil, wrapGCPError(err)
+	}
+	return data, nil
 }
 
 type gcpStorage struct {

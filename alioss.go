@@ -16,8 +16,11 @@ package storage
 
 import (
 	"bytes"
+	"context"
 	"errors"
+	"fmt"
 	"io"
+	"net/http"
 	"net/url"
 	"os"
 	"strings"
@@ -32,6 +35,14 @@ func wrapAliOSSError(err error) error {
 	}
 	var svcErr oss.ServiceError
 	if errors.As(err, &svcErr) {
+		switch {
+		case svcErr.StatusCode == http.StatusNotFound:
+			err = fmt.Errorf("%w: %w", ErrNotFound, err)
+		case svcErr.Code == "FileAlreadyExists":
+			err = fmt.Errorf("%w: %w", ErrObjectExists, err)
+		case svcErr.StatusCode == http.StatusRequestedRangeNotSatisfiable:
+			err = fmt.Errorf("%w: %w", ErrNotFound, err)
+		}
 		return &ErrorWithStatusCode{
 			Err:        err,
 			StatusCode: svcErr.StatusCode,
@@ -89,6 +100,42 @@ func (s *aliOSSStorage) UploadFile(filepath, storagePath, contentType string) (s
 	}
 
 	return s.location(storagePath), info.Size(), nil
+}
+
+// UploadDataIfAbsent writes with forbid-overwrite: OSS refuses the write
+// with 409 FileAlreadyExists when an object is there.
+func (s *aliOSSStorage) UploadDataIfAbsent(ctx context.Context, data []byte, storagePath, contentType string) (string, int64, error) {
+	if err := s.bucket.PutObject(storagePath, bytes.NewReader(data), oss.ContentType(contentType), oss.ForbidOverWrite(true), oss.WithContext(ctx)); err != nil {
+		return "", 0, wrapAliOSSError(err)
+	}
+	return s.location(storagePath), int64(len(data)), nil
+}
+
+func (s *aliOSSStorage) UploadFileIfAbsent(ctx context.Context, filepath, storagePath, contentType string) (string, int64, error) {
+	stat, err := os.Stat(filepath)
+	if err != nil {
+		return "", 0, err
+	}
+	if err := s.bucket.PutObjectFromFile(storagePath, filepath, oss.ContentType(contentType), oss.ForbidOverWrite(true), oss.WithContext(ctx)); err != nil {
+		return "", 0, wrapAliOSSError(err)
+	}
+	return s.location(storagePath), stat.Size(), nil
+}
+
+func (s *aliOSSStorage) DownloadRange(ctx context.Context, storagePath string, off, n int64) ([]byte, error) {
+	if off < 0 || n <= 0 {
+		return nil, fmt.Errorf("storage: invalid range %d+%d", off, n)
+	}
+	reader, err := s.bucket.GetObject(storagePath, oss.Range(off, off+n-1), oss.WithContext(ctx))
+	if err != nil {
+		return nil, wrapAliOSSError(err)
+	}
+	defer reader.Close()
+	data, err := io.ReadAll(reader)
+	if err != nil {
+		return nil, wrapAliOSSError(err)
+	}
+	return data, nil
 }
 
 func (s *aliOSSStorage) location(storagePath string) string {

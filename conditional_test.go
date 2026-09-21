@@ -14,14 +14,7 @@ import (
 func testConditionalAndRanged(t *testing.T, s Storage, prefix string) {
 	t.Helper()
 	ctx := context.Background()
-	cu, ok := s.(ConditionalUploader)
-	if !ok {
-		t.Fatal("no conditional uploads")
-	}
-	rd, ok := s.(RangeDownloader)
-	if !ok {
-		t.Fatal("no ranged downloads")
-	}
+	cu, rd := s, s
 	key := prefix + "/conditional"
 	t.Cleanup(func() { _ = s.DeleteObjects([]string{key, prefix + "/file", prefix + "/ranged"}) })
 
