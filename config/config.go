@@ -59,6 +59,24 @@ type LocalConfig struct {
 
 func (*LocalConfig) storageConfig() {}
 
+type OCIConfig struct {
+	TenancyOCID          string `yaml:"tenancy_ocid,omitempty"`
+	UserOCID             string `yaml:"user_ocid,omitempty"`
+	Fingerprint          string `yaml:"fingerprint,omitempty"`
+	PrivateKey           string `yaml:"private_key,omitempty"` // PEM contents, not a path
+	PrivateKeyPassphrase string `yaml:"private_key_passphrase,omitempty"`
+
+	UseWorkloadIdentity bool `yaml:"use_workload_identity,omitempty"`
+
+	Region        string `yaml:"region,omitempty"`
+	Namespace     string `yaml:"namespace,omitempty"`      // discovered via GetNamespace when empty
+	CompartmentID string `yaml:"compartment_id,omitempty"` // only used for cross-tenancy namespace lookup
+	Bucket        string `yaml:"bucket,omitempty"`
+	Endpoint      string `yaml:"endpoint,omitempty"` // overrides the derived regional endpoint
+}
+
+func (*OCIConfig) storageConfig() {}
+
 type S3Config struct {
 	AccessKey            string       `yaml:"access_key,omitempty"`
 	Secret               string       `yaml:"secret,omitempty"`

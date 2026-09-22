@@ -29,6 +29,7 @@ type (
 	AzureConfig  = config.AzureConfig
 	GCPConfig    = config.GCPConfig
 	LocalConfig  = config.LocalConfig
+	OCIConfig    = config.OCIConfig
 	S3Config     = config.S3Config
 	ProxyConfig  = config.ProxyConfig
 )
@@ -43,6 +44,8 @@ func newStorage(conf Config) (Storage, error) {
 		return NewGCP(c)
 	case *LocalConfig:
 		return NewLocal(c)
+	case *OCIConfig:
+		return NewOCI(c)
 	case *S3Config:
 		return NewS3(c)
 	default:

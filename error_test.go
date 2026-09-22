@@ -200,3 +200,38 @@ func TestWrapAliOSSError(t *testing.T) {
 		require.False(t, errors.As(got, &sce))
 	})
 }
+
+// ociServiceError stands in for the SDK's unexported servicefailure, which
+// implements common.ServiceError.
+type ociServiceError struct{ status int }
+
+func (e *ociServiceError) Error() string           { return "oci failure" }
+func (e *ociServiceError) GetHTTPStatusCode() int  { return e.status }
+func (e *ociServiceError) GetMessage() string      { return "oci failure" }
+func (e *ociServiceError) GetCode() string         { return "ObjectNotFound" }
+func (e *ociServiceError) GetOpcRequestID() string { return "req-1" }
+
+func TestWrapOCIError(t *testing.T) {
+	t.Run("nil", func(t *testing.T) {
+		require.NoError(t, wrapOCIError(nil))
+	})
+
+	t.Run("ServiceError", func(t *testing.T) {
+		inner := &ociServiceError{status: 403}
+		requireStatus(t, wrapOCIError(inner), 403, inner)
+	})
+
+	t.Run("wrapped ServiceError", func(t *testing.T) {
+		inner := &ociServiceError{status: 404}
+		wrapped := fmt.Errorf("get: %w", inner)
+		requireStatus(t, wrapOCIError(wrapped), 404, inner)
+	})
+
+	t.Run("plain error passes through", func(t *testing.T) {
+		plain := errors.New("eof")
+		got := wrapOCIError(plain)
+		require.Same(t, plain, got)
+		var sce *ErrorWithStatusCode
+		require.False(t, errors.As(got, &sce))
+	})
+}
