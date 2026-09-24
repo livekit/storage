@@ -277,6 +277,72 @@ func TestS3Location(t *testing.T) {
 	}
 }
 
+func TestOCILocation(t *testing.T) {
+	cases := []struct {
+		name        string
+		conf        OCIConfig
+		namespace   string
+		host        string
+		storagePath string
+		want        string
+	}{
+		{
+			name:        "normal",
+			conf:        OCIConfig{Bucket: "mybucket"},
+			namespace:   "myns",
+			host:        "objectstorage.us-ashburn-1.oraclecloud.com",
+			storagePath: "foo.mp4",
+			want:        "https://objectstorage.us-ashburn-1.oraclecloud.com/n/myns/b/mybucket/o/foo.mp4",
+		},
+		{
+			name:        "nested path",
+			conf:        OCIConfig{Bucket: "mybucket"},
+			namespace:   "myns",
+			host:        "objectstorage.us-ashburn-1.oraclecloud.com",
+			storagePath: "a/b/c.mp4",
+			want:        "https://objectstorage.us-ashburn-1.oraclecloud.com/n/myns/b/mybucket/o/a/b/c.mp4",
+		},
+		{
+			name:        "storagePath with leading slash",
+			conf:        OCIConfig{Bucket: "mybucket"},
+			namespace:   "myns",
+			host:        "objectstorage.us-ashburn-1.oraclecloud.com",
+			storagePath: "/foo.mp4",
+			want:        "https://objectstorage.us-ashburn-1.oraclecloud.com/n/myns/b/mybucket/o/foo.mp4",
+		},
+		{
+			name:        "space in key",
+			conf:        OCIConfig{Bucket: "mybucket"},
+			namespace:   "myns",
+			host:        "objectstorage.us-ashburn-1.oraclecloud.com",
+			storagePath: "folder/my file.mp4",
+			want:        "https://objectstorage.us-ashburn-1.oraclecloud.com/n/myns/b/mybucket/o/folder/my%20file.mp4",
+		},
+		{
+			name:        "unicode in key",
+			conf:        OCIConfig{Bucket: "mybucket"},
+			namespace:   "myns",
+			host:        "objectstorage.us-ashburn-1.oraclecloud.com",
+			storagePath: "café/résumé.mp4",
+			want:        "https://objectstorage.us-ashburn-1.oraclecloud.com/n/myns/b/mybucket/o/caf%C3%A9/r%C3%A9sum%C3%A9.mp4",
+		},
+		{
+			name:        "government realm host",
+			conf:        OCIConfig{Bucket: "mybucket"},
+			namespace:   "myns",
+			host:        "objectstorage.us-langley-1.oraclegovcloud.com",
+			storagePath: "foo.mp4",
+			want:        "https://objectstorage.us-langley-1.oraclegovcloud.com/n/myns/b/mybucket/o/foo.mp4",
+		},
+	}
+	for _, tc := range cases {
+		s := &ociStorage{conf: &tc.conf, namespace: tc.namespace, host: tc.host}
+		got := s.location(tc.storagePath)
+		require.Equal(t, tc.want, got, tc.name)
+		requireWellFormedHTTPLocation(t, got, tc.name)
+	}
+}
+
 func TestLocalLocation(t *testing.T) {
 	cases := []struct {
 		name        string

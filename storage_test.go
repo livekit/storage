@@ -119,6 +119,34 @@ func TestOCI(t *testing.T) {
 	testStorage(t, s)
 }
 
+func TestOCINative(t *testing.T) {
+	tenancy := os.Getenv("OCI_TENANCY_OCID")
+	user := os.Getenv("OCI_USER_OCID")
+	fingerprint := os.Getenv("OCI_FINGERPRINT")
+	privateKey := os.Getenv("OCI_PRIVATE_KEY")
+	namespace := os.Getenv("OCI_NAMESPACE")
+	region := os.Getenv("OCI_REGION")
+	bucket := os.Getenv("OCI_NATIVE_BUCKET")
+
+	if tenancy == "" || user == "" || fingerprint == "" || privateKey == "" ||
+		namespace == "" || region == "" || bucket == "" {
+		t.Skip("Missing env vars")
+	}
+
+	s, err := storage.New(&storage.OCIConfig{
+		TenancyOCID: tenancy,
+		UserOCID:    user,
+		Fingerprint: fingerprint,
+		PrivateKey:  privateKey,
+		Namespace:   namespace,
+		Region:      region,
+		Bucket:      bucket,
+	})
+	require.NoError(t, err)
+
+	testStorage(t, s)
+}
+
 func TestSupabase(t *testing.T) {
 	key := os.Getenv("SUPABASE_ACCESS_KEY")
 	secret := os.Getenv("SUPABASE_SECRET")
