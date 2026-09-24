@@ -66,6 +66,7 @@ type OCIConfig struct {
 	PrivateKey           string `yaml:"private_key,omitempty"` // PEM contents, not a path
 	PrivateKeyPassphrase string `yaml:"private_key_passphrase,omitempty"`
 
+	// Requires OCI_RESOURCE_PRINCIPAL_VERSION and OCI_RESOURCE_PRINCIPAL_REGION to be set in the environment.
 	UseWorkloadIdentity bool `yaml:"use_workload_identity,omitempty"`
 
 	Region        string `yaml:"region,omitempty"`
