@@ -1,6 +1,6 @@
 module github.com/livekit/storage
 
-go 1.26
+go 1.26.0
 
 require (
 	cloud.google.com/go/storage v1.62.3
@@ -19,7 +19,7 @@ require (
 	github.com/livekit/protocol v1.46.7-0.20260605212020-c0615a2f6f84
 	github.com/oracle/oci-go-sdk/v65 v65.100.0
 	github.com/stretchr/testify v1.11.1
-	golang.org/x/oauth2 v0.36.0
+	golang.org/x/oauth2 v0.37.0
 	google.golang.org/api v0.283.0
 )
 
