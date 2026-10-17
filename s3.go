@@ -243,11 +243,20 @@ func (s *s3Storage) upload(reader io.Reader, storagePath, contentType string) (s
 		input.ContentDisposition = &contentDisposition
 	}
 
+	if _, err := s.uploader(client).Upload(context.Background(), input); err != nil {
+		l.WriteLogs()
+		return "", wrapS3Error(err)
+	}
+
+	return s.location(storagePath), nil
+}
+
+func (s *s3Storage) uploader(client *s3.Client, opts ...func(*manager.Uploader)) *manager.Uploader {
 	// Uploader forces a CRC32 ChecksumAlgorithm on multipart uploads,
 	// which makes UploadPart use a trailing checksum encoded as Content-Encoding:
 	// aws-chunked. Non-AWS S3-compatible providers (e.g. OCI) don't support
 	// this, so clear the algorithm before any checksum middleware sees it.
-	uploader := manager.NewUploader(client, func(u *manager.Uploader) {
+	return manager.NewUploader(client, append(opts, func(u *manager.Uploader) {
 		if s.conf.Endpoint != "" {
 			u.ClientOptions = append(u.ClientOptions, func(o *s3.Options) {
 				o.APIOptions = append(o.APIOptions, func(stack *middleware.Stack) error {
@@ -268,14 +277,7 @@ func (s *s3Storage) upload(reader io.Reader, storagePath, contentType string) (s
 				})
 			})
 		}
-	})
-
-	if _, err := uploader.Upload(context.Background(), input); err != nil {
-		l.WriteLogs()
-		return "", wrapS3Error(err)
-	}
-
-	return s.location(storagePath), nil
+	})...)
 }
 
 func (s *s3Storage) location(storagePath string) string {

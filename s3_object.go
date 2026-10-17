@@ -62,7 +62,7 @@ func (o *s3Objects) UploadObject(ctx context.Context, storagePath string, body i
 			return ErrObjectExists
 		}
 	}
-	uploader := manager.NewUploader(o.s.getClient(nil), func(u *manager.Uploader) {
+	uploader := o.s.uploader(o.s.getClient(nil), func(u *manager.Uploader) {
 		u.PartSize = s3UploadPartSize
 	})
 	_, err := uploader.Upload(ctx, o.putInput(storagePath, body, opts))
@@ -98,6 +98,10 @@ func (o *s3Objects) GetObjectRange(ctx context.Context, storagePath string, offs
 		Key:    aws.String(storagePath),
 		Range:  aws.String(fmt.Sprintf("bytes=%d-%d", offset, offset+length-1)),
 	})
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) && apiErr.ErrorCode() == "InvalidRange" {
+		return []byte{}, nil
+	}
 	if err != nil {
 		return nil, wrapS3ObjectError(err)
 	}

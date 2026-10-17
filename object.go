@@ -32,13 +32,20 @@ var (
 	ErrObjectExists   = objects.ErrExists
 )
 
-// NewObjectStorage supports S3 (and S3-compatible endpoints) and local storage.
 func NewObjectStorage(conf Config) (ObjectStorage, error) {
 	switch c := conf.(type) {
-	case *S3Config:
-		return NewS3Objects(c)
+	case *AliOSSConfig:
+		return NewAliOSSObjects(c)
+	case *AzureConfig:
+		return NewAzureObjects(c)
+	case *GCPConfig:
+		return NewGCPObjects(c)
 	case *LocalConfig:
 		return NewLocalObjects(c)
+	case *OCIConfig:
+		return NewOCIObjects(c)
+	case *S3Config:
+		return NewS3Objects(c)
 	default:
 		return nil, fmt.Errorf("object storage is not supported for %T", conf)
 	}

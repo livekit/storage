@@ -97,6 +97,9 @@ func testObjectStorage(t *testing.T, s storage.ObjectStorage) {
 		got, err = s.GetObjectRange(ctx, small, 6, 1000)
 		require.NoError(t, err)
 		require.Equal(t, payload[6:], got)
+		got, err = s.GetObjectRange(ctx, small, int64(len(payload)), 4)
+		require.NoError(t, err)
+		require.Empty(t, got)
 	})
 
 	t.Run("not found", func(t *testing.T) {
@@ -117,7 +120,7 @@ func testObjectStorage(t *testing.T, s storage.ObjectStorage) {
 		require.NoError(t, err)
 		sort.Strings(keys)
 		require.Equal(t, []string{large, small}, keys)
-		require.NoError(t, s.DeleteObjects(ctx, []string{small, large}))
+		require.NoError(t, s.DeleteObjects(ctx, []string{small, large, missing}))
 		keys, err = s.ListObjects(ctx, prefix)
 		require.NoError(t, err)
 		require.Empty(t, keys)
@@ -128,4 +131,80 @@ func testObjectStorage(t *testing.T, s storage.ObjectStorage) {
 		require.NoError(t, err)
 		require.NotEmpty(t, url)
 	})
+}
+
+// TestOCIObjects reaches OCI through its S3 compatibility API, as TestOCI does.
+func TestOCIObjects(t *testing.T) {
+	key := os.Getenv("OCI_ACCESS_KEY")
+	secret := os.Getenv("OCI_SECRET")
+	region := os.Getenv("OCI_REGION")
+	endpoint := os.Getenv("OCI_ENDPOINT")
+	bucket := os.Getenv("OCI_BUCKET")
+	if key == "" || secret == "" || region == "" || endpoint == "" || bucket == "" {
+		t.Skip("Missing env vars")
+	}
+	s, err := storage.NewObjectStorage(&storage.S3Config{
+		AccessKey:      key,
+		Secret:         secret,
+		Region:         region,
+		Endpoint:       endpoint,
+		Bucket:         bucket,
+		ForcePathStyle: true,
+	})
+	require.NoError(t, err)
+	testObjectStorage(t, s)
+}
+
+// TestOCINativeObjects uses the OCI SDK with an API key.
+func TestOCINativeObjects(t *testing.T) {
+	conf := &storage.OCIConfig{
+		TenancyOCID: os.Getenv("OCI_TENANCY_OCID"),
+		UserOCID:    os.Getenv("OCI_USER_OCID"),
+		Fingerprint: os.Getenv("OCI_FINGERPRINT"),
+		PrivateKey:  os.Getenv("OCI_PRIVATE_KEY"),
+		Region:      os.Getenv("OCI_REGION"),
+		Bucket:      os.Getenv("OCI_BUCKET"),
+	}
+	if conf.TenancyOCID == "" || conf.UserOCID == "" || conf.Fingerprint == "" || conf.PrivateKey == "" || conf.Region == "" || conf.Bucket == "" {
+		t.Skip("Missing env vars")
+	}
+	s, err := storage.NewObjectStorage(conf)
+	require.NoError(t, err)
+	testObjectStorage(t, s)
+}
+
+func TestGCPObjects(t *testing.T) {
+	creds := os.Getenv("GOOGLE_APPLICATION_CREDENTIALS")
+	bucket := os.Getenv("GCP_BUCKET")
+	if creds == "" || bucket == "" {
+		t.Skip("Missing env vars")
+	}
+	s, err := storage.NewObjectStorage(&storage.GCPConfig{CredentialsJSON: creds, Bucket: bucket})
+	require.NoError(t, err)
+	testObjectStorage(t, s)
+}
+
+func TestAzureObjects(t *testing.T) {
+	name := os.Getenv("AZURE_ACCOUNT_NAME")
+	key := os.Getenv("AZURE_ACCOUNT_KEY")
+	container := os.Getenv("AZURE_CONTAINER_NAME")
+	if name == "" || key == "" || container == "" {
+		t.Skip("Missing env vars")
+	}
+	s, err := storage.NewObjectStorage(&storage.AzureConfig{AccountName: name, AccountKey: key, ContainerName: container})
+	require.NoError(t, err)
+	testObjectStorage(t, s)
+}
+
+func TestAliOSSObjects(t *testing.T) {
+	key := os.Getenv("ALI_ACCESS_KEY")
+	secret := os.Getenv("ALI_SECRET")
+	endpoint := os.Getenv("ALI_ENDPOINT")
+	bucket := os.Getenv("ALI_BUCKET")
+	if key == "" || secret == "" || endpoint == "" || bucket == "" {
+		t.Skip("Missing env vars")
+	}
+	s, err := storage.NewObjectStorage(&storage.AliOSSConfig{AccessKey: key, Secret: secret, Endpoint: endpoint, Bucket: bucket})
+	require.NoError(t, err)
+	testObjectStorage(t, s)
 }

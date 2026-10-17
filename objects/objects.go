@@ -29,17 +29,19 @@ import (
 // a range or stream to a writer.
 type Storage interface {
 	PutObject(ctx context.Context, storagePath string, data []byte, opts PutOptions) error
-	// UploadObject streams body in parts, holding about one part in memory.
+	// UploadObject streams body in parts: memory is bounded by the part size
+	// times the upload concurrency, whatever the object's size.
 	UploadObject(ctx context.Context, storagePath string, body io.Reader, opts PutOptions) error
 
 	GetObject(ctx context.Context, storagePath string) ([]byte, error)
-	// GetObjectRange reads length bytes from offset; past the end it returns
-	// what the object holds.
+	// GetObjectRange reads length bytes from offset. A range running past the
+	// end returns what the object holds, one starting at or past it no bytes.
 	GetObjectRange(ctx context.Context, storagePath string, offset, length int64) ([]byte, error)
 	DownloadObject(ctx context.Context, storagePath string, w io.Writer) (int64, error)
 	ObjectExists(ctx context.Context, storagePath string) (bool, error)
 
 	ListObjects(ctx context.Context, prefix string) ([]string, error)
+	// DeleteObjects succeeds for paths that hold nothing.
 	DeleteObjects(ctx context.Context, storagePaths []string) error
 
 	GeneratePresignedUrl(ctx context.Context, storagePath string, expiration time.Duration) (string, error)

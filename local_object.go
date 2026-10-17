@@ -114,7 +114,12 @@ func (o *localObjects) ListObjects(_ context.Context, prefix string) ([]string, 
 }
 
 func (o *localObjects) DeleteObjects(_ context.Context, storagePaths []string) error {
-	return o.u.DeleteObjects(storagePaths)
+	for _, p := range storagePaths {
+		if err := o.u.DeleteObject(p); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return err
+		}
+	}
+	return nil
 }
 
 func (o *localObjects) GeneratePresignedUrl(_ context.Context, storagePath string, expiration time.Duration) (string, error) {
