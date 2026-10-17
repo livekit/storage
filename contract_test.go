@@ -40,6 +40,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/livekit/storage"
+	"github.com/livekit/storage/objects"
 )
 
 // These hold what a caller's environment relies on, which the emulators,
@@ -389,8 +390,12 @@ func TestAliOSSRetries(t *testing.T) {
 
 	requests.Store(0)
 	failNext.Store(http.StatusForbidden)
-	require.Error(t, s.PutObject(ctx, "k", []byte("hello"), storage.PutOptions{}))
+	err = s.PutObject(ctx, "k", []byte("hello"), storage.PutOptions{})
 	require.EqualValues(t, 1, requests.Load(), "a 403 is not retried")
+	// The status is found with the SDK-free package's type.
+	var status *objects.ErrorWithStatusCode
+	require.ErrorAs(t, err, &status)
+	require.Equal(t, http.StatusForbidden, status.StatusCode)
 }
 
 func selfSignedCert(t *testing.T) []byte {

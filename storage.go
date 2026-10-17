@@ -43,9 +43,10 @@ import (
 // The interfaces live in storage/objects so that code implementing or
 // accepting them without creating one doesn't pull in every provider SDK.
 type (
-	Storage    = objects.Storage
-	Bucket     = objects.Bucket
-	PutOptions = objects.PutOptions
+	Storage             = objects.Storage
+	Bucket              = objects.Bucket
+	PutOptions          = objects.PutOptions
+	ErrorWithStatusCode = objects.ErrorWithStatusCode
 )
 
 var (
