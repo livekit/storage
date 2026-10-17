@@ -17,6 +17,7 @@ package storage
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -60,8 +61,23 @@ func NewOCI(conf *OCIConfig) (Storage, error) {
 	}
 	// The SDK's 60s http.Client.Timeout covers reading the body and would cut a
 	// long transfer; a response header timeout catches a dead connection instead.
+	// Its transport wrapper stays, as it loads OCI_DEFAULT_CERTS_PATH and
+	// refreshes the TLS config.
 	if hc, ok := client.HTTPClient.(*http.Client); ok {
-		client.HTTPClient = &http.Client{Transport: transportWithTimeouts(hc.Transport), CheckRedirect: hc.CheckRedirect, Jar: hc.Jar}
+		if w, ok := hc.Transport.(*common.OciHTTPTransportWrapper); ok {
+			w.TransportTemplate = func(tlsConfig *tls.Config) (http.RoundTripper, error) {
+				t, err := common.DefaultTransport(tlsConfig)
+				if err != nil {
+					return nil, err
+				}
+				return transportWithTimeouts(t), nil
+			}
+		}
+		c := &http.Client{Transport: hc.Transport, CheckRedirect: hc.CheckRedirect, Jar: hc.Jar}
+		if os.Getenv(common.CustomClientTimeoutEnvVar) != "" {
+			c.Timeout = hc.Timeout
+		}
+		client.HTTPClient = c
 	}
 
 	// The SDK only prepends a scheme to client.Host on the first request, so
@@ -116,12 +132,9 @@ func newConfigProvider(conf *OCIConfig) (common.ConfigurationProvider, error) {
 	return common.DefaultConfigProvider(), nil
 }
 
-func (s *ociStorage) UploadData(ctx context.Context, data []byte, storagePath, contentType string) (string, int64, error) {
-	if err := s.PutObject(ctx, storagePath, data, PutOptions{ContentType: contentType}); err != nil {
-		return "", 0, err
-	}
-	return s.location(storagePath), int64(len(data)), nil
-}
+// UploadFile sends the file in one PutObject, up to OCI's 50 GiB, which the SDK
+// can retry by seeking it: a multipart upload would need more permissions and
+// can leave uncommitted parts behind.
 
 func (s *ociStorage) UploadFile(ctx context.Context, filepath, storagePath, contentType string) (string, int64, error) {
 	file, err := os.Open(filepath)
@@ -134,7 +147,7 @@ func (s *ociStorage) UploadFile(ctx context.Context, filepath, storagePath, cont
 	if err != nil {
 		return "", 0, err
 	}
-	if err = s.UploadObject(ctx, storagePath, file, PutOptions{ContentType: contentType}); err != nil {
+	if err = s.put(ctx, storagePath, file, stat.Size(), PutOptions{ContentType: contentType}); err != nil {
 		return "", 0, err
 	}
 	return s.location(storagePath), stat.Size(), nil
@@ -162,11 +175,11 @@ func (s *ociStorage) DownloadFile(ctx context.Context, filepath, storagePath str
 	return s.DownloadObject(ctx, storagePath, file)
 }
 
-// GeneratePresignedUrl creates a pre-authenticated request. Unlike an S3
+// PresignedURL creates a pre-authenticated request. Unlike an S3
 // presigned URL, a PAR is a durable object: it is listable and revocable, it
 // costs an API call to mint, and it needs PAR_MANAGE on the bucket. Its access
 // URI is returned only here and cannot be read back afterwards.
-func (s *ociStorage) presignedUrl(ctx context.Context, storagePath string, expiration time.Duration) (string, error) {
+func (s *ociStorage) presignedURL(ctx context.Context, storagePath string, expiration time.Duration) (string, error) {
 	name := fmt.Sprintf("livekit-storage-%s-%d", storagePath, time.Now().UnixNano())
 	expires := common.SDKTime{Time: time.Now().Add(expiration)}
 
@@ -204,14 +217,24 @@ func wrapOCIError(err error) error {
 const ociUploadPartSize = 16 << 20
 
 func (s *ociStorage) PutObject(ctx context.Context, storagePath string, data []byte, opts PutOptions) error {
-	size := int64(len(data))
+	body := common.NewOCIReadSeekCloser(io.NopCloser(bytes.NewReader(data)))
+	return s.put(ctx, storagePath, body, int64(len(data)), opts)
+}
+
+// ociContentDisposition has browsers show an object rather than download it,
+// as on S3.
+var ociContentDisposition = common.String("inline")
+
+// put sends body in one request. It must be seekable, so the SDK can re-read
+// it when it retries.
+func (s *ociStorage) put(ctx context.Context, storagePath string, body io.ReadCloser, size int64, opts PutOptions) error {
 	req := objectstorage.PutObjectRequest{
-		NamespaceName: &s.namespace,
-		BucketName:    &s.conf.Bucket,
-		ObjectName:    &storagePath,
-		// Seekable, so the SDK can re-read it when it retries.
-		PutObjectBody: common.NewOCIReadSeekCloser(io.NopCloser(bytes.NewReader(data))),
-		ContentLength: &size,
+		NamespaceName:      &s.namespace,
+		BucketName:         &s.conf.Bucket,
+		ObjectName:         &storagePath,
+		PutObjectBody:      body,
+		ContentLength:      &size,
+		ContentDisposition: ociContentDisposition,
 	}
 	if opts.ContentType != "" {
 		req.ContentType = &opts.ContentType
@@ -223,30 +246,26 @@ func (s *ociStorage) PutObject(ctx context.Context, storagePath string, data []b
 	return wrapOCIObjectError(err)
 }
 
-// UploadObject sends a body that fits one part with PutObject, otherwise a
+// UploadObject sends a body smaller than a part with PutObject, otherwise a
 // multipart upload of sequential parts through one buffer. IfAbsent is checked
 // at create and again at commit, so it is atomic here.
 func (s *ociStorage) UploadObject(ctx context.Context, storagePath string, body io.Reader, opts PutOptions) error {
 	// The condition is checked again at create and commit; this check spares a
 	// refused upload its traffic, and refuses it where a store ignores
 	// if-none-match on multipart uploads, as floci-oci does.
-	if opts.IfAbsent {
-		exists, err := s.ObjectExists(ctx, storagePath)
-		if err != nil {
-			return err
-		}
-		if exists {
-			return ErrObjectExists
-		}
+	if opts.IfAbsent && presentBeforeUpload(ctx, s, storagePath) {
+		return ErrExists
 	}
-	part := make([]byte, ociUploadPartSize)
-	n, err := io.ReadFull(body, part)
-	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-		return s.PutObject(ctx, storagePath, part[:n], opts)
-	}
-	if err != nil {
+	// The buffer grows only as far as the body goes, so a small one costs no
+	// whole part.
+	var first bytes.Buffer
+	if _, err := first.ReadFrom(io.LimitReader(body, ociUploadPartSize)); err != nil {
 		return err
 	}
+	if first.Len() < ociUploadPartSize {
+		return s.PutObject(ctx, storagePath, first.Bytes(), opts)
+	}
+	part := first.Bytes()
 
 	var ifNoneMatch, contentType *string
 	if opts.IfAbsent {
@@ -260,15 +279,16 @@ func (s *ociStorage) UploadObject(ctx context.Context, storagePath string, body 
 		BucketName:    &s.conf.Bucket,
 		IfNoneMatch:   ifNoneMatch,
 		CreateMultipartUploadDetails: objectstorage.CreateMultipartUploadDetails{
-			Object:      &storagePath,
-			ContentType: contentType,
+			Object:             &storagePath,
+			ContentType:        contentType,
+			ContentDisposition: ociContentDisposition,
 		},
 	})
 	if err != nil {
 		return wrapOCIObjectError(err)
 	}
 
-	if err = s.uploadParts(ctx, storagePath, created.UploadId, body, part, n, ifNoneMatch); err != nil {
+	if err = s.uploadParts(ctx, storagePath, created.UploadId, body, part, len(part), ifNoneMatch); err != nil {
 		_, _ = s.client.AbortMultipartUpload(context.WithoutCancel(ctx), objectstorage.AbortMultipartUploadRequest{
 			NamespaceName: &s.namespace,
 			BucketName:    &s.conf.Bucket,
@@ -376,7 +396,7 @@ func (s *ociStorage) ObjectExists(ctx context.Context, storagePath string) (bool
 		ObjectName:    &storagePath,
 	})
 	err = wrapOCIObjectError(err)
-	if errors.Is(err, ErrObjectNotFound) {
+	if errors.Is(err, ErrNotFound) {
 		return false, nil
 	}
 	return err == nil, err
@@ -412,15 +432,15 @@ func (s *ociStorage) DeleteObjects(ctx context.Context, storagePaths []string) e
 			BucketName:    &s.conf.Bucket,
 			ObjectName:    &p,
 		})
-		if err = wrapOCIObjectError(err); err != nil && !errors.Is(err, ErrObjectNotFound) {
+		if err = wrapOCIObjectError(err); err != nil && !errors.Is(err, ErrNotFound) {
 			return err
 		}
 	}
 	return nil
 }
 
-func (s *ociStorage) GeneratePresignedUrl(ctx context.Context, storagePath string, expiration time.Duration) (string, error) {
-	return s.presignedUrl(ctx, storagePath, expiration)
+func (s *ociStorage) PresignedURL(ctx context.Context, storagePath string, expiration time.Duration) (string, error) {
+	return s.presignedURL(ctx, storagePath, expiration)
 }
 
 func wrapOCIObjectError(err error) error {
@@ -435,10 +455,10 @@ func wrapOCIObjectError(err error) error {
 			// NotAuthorizedOrNotFound stays an error.
 			switch se.GetCode() {
 			case "ObjectNotFound", "BadErrorResponse":
-				return fmt.Errorf("%w: %w", ErrObjectNotFound, wrapOCIError(err))
+				return fmt.Errorf("%w: %w", ErrNotFound, wrapOCIError(err))
 			}
 		case http.StatusPreconditionFailed:
-			return fmt.Errorf("%w: %w", ErrObjectExists, wrapOCIError(err))
+			return fmt.Errorf("%w: %w", ErrExists, wrapOCIError(err))
 		}
 	}
 	return wrapOCIError(err)

@@ -32,26 +32,37 @@ jobs:
         run: go install github.com/gotesttools/gotestfmt/v2/cmd/gotestfmt@9eae5abc81d6d08f73268741ef4a8b97f29b60d8 # v2.4.1
 
       - name: Download Go modules
-        run: go mod download
+        run: go mod download && (cd e2e && go mod download)
 
       - name: Lint
         uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
         with:
           version: v2.14.0
 
+      - name: Lint e2e
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          version: v2.14.0
+          working-directory: e2e
+
+      # The e2e module holds the suites: here they run on the local backend, and
+      # on any real account whose secrets are set.
       - name: Test
         run: |
           set -euo pipefail
-          go test -race -json -v -skip '^TestFloci' ./... 2>&1 | gotestfmt
+          go test -race -json -v ./... 2>&1 | gotestfmt
+          cd e2e && go test -race -json -v -skip '^Test(Floci|MinIO)' ./... 2>&1 | gotestfmt
 
-  # Every backend end to end against its floci emulator (floci_test.go), one
-  # check per provider.
-  floci:
+  # Every backend end to end against its floci emulator (e2e/floci_test.go),
+  # and S3 against MinIO (e2e/minio_test.go), whose conditional writes are
+  # atomic where floci's are not. One check each; TestWorkflowRunsEveryEmulatorTest
+  # fails when a test is missing here.
+  e2e:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        provider: [S3, Azure, GCP, OCI]
+        test: [FlociS3, FlociAzure, FlociGCP, FlociOCI, MinIO]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -70,7 +81,14 @@ jobs:
       - name: Set up gotestfmt
         run: go install github.com/gotesttools/gotestfmt/v2/cmd/gotestfmt@9eae5abc81d6d08f73268741ef4a8b97f29b60d8 # v2.4.1
 
-      - name: Test against floci
+      - name: Install MinIO
+        if: matrix.test == 'MinIO'
+        run: |
+          go install github.com/minio/minio@v0.0.0-20260212201848-7aac2a2c5b7c
+          echo "MINIO_BIN=$(go env GOPATH)/bin/minio" >> "$GITHUB_ENV"
+
+      - name: Test
+        working-directory: e2e
         run: |
           set -euo pipefail
-          go test -race -json -v -run '^TestFloci${{ matrix.provider }}$' ./... 2>&1 | gotestfmt
+          go test -race -json -v -run '^Test${{ matrix.test }}$' ./... 2>&1 | gotestfmt

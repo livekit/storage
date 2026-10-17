@@ -72,13 +72,6 @@ func NewAliOSS(conf *AliOSSConfig) (Storage, error) {
 	}, nil
 }
 
-func (s *aliOSSStorage) UploadData(ctx context.Context, data []byte, storagePath, contentType string) (string, int64, error) {
-	if err := s.PutObject(ctx, storagePath, data, PutOptions{ContentType: contentType}); err != nil {
-		return "", 0, err
-	}
-	return s.location(storagePath), int64(len(data)), nil
-}
-
 func (s *aliOSSStorage) UploadFile(ctx context.Context, filepath, storagePath, contentType string) (string, int64, error) {
 	info, err := os.Stat(filepath)
 	if err != nil {
@@ -108,7 +101,7 @@ func (s *aliOSSStorage) DownloadFile(ctx context.Context, filepath, storagePath 
 	return info.Size(), nil
 }
 
-func (s *aliOSSStorage) presignedUrl(storagePath string, expiration time.Duration) (string, error) {
+func (s *aliOSSStorage) presignedURL(storagePath string, expiration time.Duration) (string, error) {
 	u, err := s.bucket.SignURL(storagePath, oss.HTTPGet, int64(expiration.Seconds()))
 	if err != nil {
 		return "", wrapAliOSSError(err)
@@ -225,8 +218,8 @@ func (s *aliOSSStorage) DeleteObjects(ctx context.Context, storagePaths []string
 	return nil
 }
 
-func (s *aliOSSStorage) GeneratePresignedUrl(_ context.Context, storagePath string, expiration time.Duration) (string, error) {
-	return s.presignedUrl(storagePath, expiration)
+func (s *aliOSSStorage) PresignedURL(_ context.Context, storagePath string, expiration time.Duration) (string, error) {
+	return s.presignedURL(storagePath, expiration)
 }
 
 func wrapAliOSSObjectError(err error) error {
@@ -238,9 +231,9 @@ func wrapAliOSSObjectError(err error) error {
 		switch {
 		// A HEAD answers a missing key with a bare 404.
 		case svcErr.Code == "NoSuchKey" || (svcErr.StatusCode == http.StatusNotFound && svcErr.Code == ""):
-			return fmt.Errorf("%w: %w", ErrObjectNotFound, wrapAliOSSError(err))
+			return fmt.Errorf("%w: %w", ErrNotFound, wrapAliOSSError(err))
 		case svcErr.Code == "FileAlreadyExists":
-			return fmt.Errorf("%w: %w", ErrObjectExists, wrapAliOSSError(err))
+			return fmt.Errorf("%w: %w", ErrExists, wrapAliOSSError(err))
 		}
 	}
 	return wrapAliOSSError(err)

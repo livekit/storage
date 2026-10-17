@@ -52,8 +52,10 @@ type GCPConfig struct {
 	CredentialsJSON string       `yaml:"credentials_json,omitempty"` // (env GOOGLE_APPLICATION_CREDENTIALS)
 	Bucket          string       `yaml:"bucket,omitempty"`
 	ProxyConfig     *ProxyConfig `yaml:"proxy_config,omitempty"`
-	// Endpoint points the client at an emulator, e.g. http://localhost:4588.
-	// Requests to it are unauthenticated; CredentialsJSON still signs URLs.
+	// Endpoint replaces https://storage.googleapis.com, e.g. a Private Service
+	// Connect endpoint. An http:// one is taken for an emulator, such as
+	// http://localhost:4588, and gets no credentials; CredentialsJSON still
+	// signs URLs.
 	Endpoint string `yaml:"endpoint,omitempty"`
 }
 
@@ -88,8 +90,8 @@ type S3Config struct {
 	AccessKey            string       `yaml:"access_key,omitempty"`
 	Secret               string       `yaml:"secret,omitempty"`
 	SessionToken         string       `yaml:"session_token,omitempty"`
-	AssumeRoleArn        string       `yaml:"assume_role_arn,omitempty"`         // ARN of the role to assume for file upload. Egress will make an AssumeRole API call using the provided access_key and secret to assume that role
-	AssumeRoleExternalId string       `yaml:"assume_role_external_id,omitempty"` // ExternalID to use when assuming role for upload
+	AssumeRoleARN        string       `yaml:"assume_role_arn,omitempty"`         // ARN of the role to assume for file upload. Egress will make an AssumeRole API call using the provided access_key and secret to assume that role
+	AssumeRoleExternalID string       `yaml:"assume_role_external_id,omitempty"` // ExternalID to use when assuming role for upload
 	Region               string       `yaml:"region,omitempty"`
 	Endpoint             string       `yaml:"endpoint,omitempty"`
 	Bucket               string       `yaml:"bucket,omitempty"`
@@ -108,7 +110,7 @@ type S3Config struct {
 func (*S3Config) storageConfig() {}
 
 type ProxyConfig struct {
-	Url      string `yaml:"url,omitempty"`
+	URL      string `yaml:"url,omitempty"`
 	Username string `yaml:"username,omitempty"`
 	Password string `yaml:"password,omitempty"`
 }

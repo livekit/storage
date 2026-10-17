@@ -51,22 +51,21 @@ type Bucket interface {
 	// ListObjects returns every key under prefix, recursively, as full paths,
 	// in byte order.
 	ListObjects(ctx context.Context, prefix string) ([]string, error)
-	// DeleteObjects succeeds for paths that hold nothing and fails when a path
-	// is not deleted; some may be deleted by then, and a retry is safe. GCS,
-	// Azure and OCI send one request per path.
+	// DeleteObjects succeeds for paths that hold nothing, as S3's delete does,
+	// and fails when a path is not deleted; some may be deleted by then, and a
+	// retry is safe. GCS, Azure and OCI send one request per path.
 	DeleteObjects(ctx context.Context, storagePaths []string) error
 
-	// GeneratePresignedUrl is a GET URL; local returns a file:// URL.
-	GeneratePresignedUrl(ctx context.Context, storagePath string, expiration time.Duration) (string, error)
+	// PresignedURL is a GET URL; local returns a file:// URL.
+	PresignedURL(ctx context.Context, storagePath string, expiration time.Duration) (string, error)
 }
 
 // Storage is Bucket and the calls that publish and fetch whole files.
 type Storage interface {
 	Bucket
 
-	// UploadData and UploadFile replace any object at storagePath and return
-	// its location, a URL to it.
-	UploadData(ctx context.Context, data []byte, storagePath, contentType string) (location string, size int64, err error)
+	// UploadFile replaces any object at storagePath and returns its location,
+	// a URL to it.
 	UploadFile(ctx context.Context, filepath, storagePath, contentType string) (location string, size int64, err error)
 	DownloadFile(ctx context.Context, filepath, storagePath string) (size int64, err error)
 }

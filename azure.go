@@ -23,6 +23,7 @@ import (
 	"net/url"
 	"os"
 	"path"
+	"strings"
 	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
@@ -54,7 +55,8 @@ const azureParallelism = 16
 type azureBLOBStorage struct {
 	conf       *AzureConfig
 	client     *azblob.Client
-	serviceUrl string
+	cred       *azblob.SharedKeyCredential
+	serviceURL string
 }
 
 func NewAzure(conf *AzureConfig) (Storage, error) {
@@ -63,11 +65,11 @@ func NewAzure(conf *AzureConfig) (Storage, error) {
 		return nil, err
 	}
 
-	serviceUrl := azureServiceURL(conf)
-	if _, err := url.Parse(serviceUrl); err != nil {
+	serviceURL := azureServiceURL(conf)
+	if _, err := url.Parse(serviceURL); err != nil {
 		return nil, fmt.Errorf("azure endpoint: %w", err)
 	}
-	client, err := azblob.NewClientWithSharedKeyCredential(serviceUrl, cred, nil)
+	client, err := azblob.NewClientWithSharedKeyCredential(serviceURL, cred, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -75,7 +77,8 @@ func NewAzure(conf *AzureConfig) (Storage, error) {
 	return &azureBLOBStorage{
 		conf:       conf,
 		client:     client,
-		serviceUrl: serviceUrl,
+		cred:       cred,
+		serviceURL: serviceURL,
 	}, nil
 }
 
@@ -96,13 +99,6 @@ func (s *azureBLOBStorage) blobURL(storagePath string) *url.URL {
 	u, _ := url.Parse(azureServiceURL(s.conf))
 	u.Path = path.Join(u.Path, s.conf.ContainerName, storagePath)
 	return u
-}
-
-func (s *azureBLOBStorage) UploadData(ctx context.Context, data []byte, storagePath, contentType string) (string, int64, error) {
-	if err := s.PutObject(ctx, storagePath, data, PutOptions{ContentType: contentType}); err != nil {
-		return "", 0, err
-	}
-	return s.location(storagePath), int64(len(data)), nil
 }
 
 func (s *azureBLOBStorage) UploadFile(ctx context.Context, filepath, storagePath, contentType string) (string, int64, error) {
@@ -161,7 +157,7 @@ func (s *azureBLOBStorage) presignedUrlWithToken(ctx context.Context, storagePat
 	now := time.Now().UTC()
 	exp := now.Add(expiration)
 
-	svcClient, err := service.NewClient(s.serviceUrl, s.conf.TokenCredential, nil)
+	svcClient, err := service.NewClient(s.serviceURL, s.conf.TokenCredential, nil)
 	if err != nil {
 		return "", err
 	}
@@ -191,36 +187,50 @@ func (s *azureBLOBStorage) presignedUrlWithToken(ctx context.Context, storagePat
 	return loc.String(), nil
 }
 
+// PutObject sends data up to 256 MiB in one Put Blob, IfAbsent as its
+// condition, and larger data in blocks.
 func (s *azureBLOBStorage) PutObject(ctx context.Context, storagePath string, data []byte, opts PutOptions) error {
-	return s.UploadObject(ctx, storagePath, bytes.NewReader(data), opts)
+	headers, conditions := azureWriteOptions(opts)
+	_, err := s.client.UploadBuffer(ctx, s.conf.ContainerName, storagePath, data, &azblob.UploadBufferOptions{
+		BlockSize:        azureBlockSize,
+		Concurrency:      azureParallelism,
+		HTTPHeaders:      headers,
+		AccessConditions: conditions,
+	})
+	return wrapAzureObjectError(err)
+}
+
+func azureWriteOptions(opts PutOptions) (*blob.HTTPHeaders, *blob.AccessConditions) {
+	var headers *blob.HTTPHeaders
+	if opts.ContentType != "" {
+		headers = &blob.HTTPHeaders{BlobContentType: to.Ptr(opts.ContentType)}
+	}
+	var conditions *blob.AccessConditions
+	if opts.IfAbsent {
+		conditions = &blob.AccessConditions{
+			ModifiedAccessConditions: &blob.ModifiedAccessConditions{IfNoneMatch: to.Ptr(azcore.ETagAny)},
+		}
+	}
+	return headers, conditions
 }
 
 // UploadObject stages blocks and commits them; IfAbsent is a condition on the
 // commit, so it is atomic here. The check before staging only spares a refused
 // upload its traffic.
 func (s *azureBLOBStorage) UploadObject(ctx context.Context, storagePath string, body io.Reader, opts PutOptions) error {
-	if opts.IfAbsent {
-		exists, err := s.ObjectExists(ctx, storagePath)
-		if err != nil {
-			return err
-		}
-		if exists {
-			return ErrObjectExists
-		}
+	if opts.IfAbsent && presentBeforeUpload(ctx, s, storagePath) {
+		return ErrExists
 	}
-	uploadOpts := &azblob.UploadStreamOptions{BlockSize: azureBlockSize, Concurrency: azureParallelism}
-	if opts.ContentType != "" {
-		uploadOpts.HTTPHeaders = &blob.HTTPHeaders{BlobContentType: to.Ptr(opts.ContentType)}
-	}
-	if opts.IfAbsent {
-		uploadOpts.AccessConditions = &blob.AccessConditions{
-			ModifiedAccessConditions: &blob.ModifiedAccessConditions{IfNoneMatch: to.Ptr(azcore.ETagAny)},
-		}
-	}
-	_, err := s.client.UploadStream(ctx, s.conf.ContainerName, storagePath, body, uploadOpts)
+	headers, conditions := azureWriteOptions(opts)
+	_, err := s.client.UploadStream(ctx, s.conf.ContainerName, storagePath, body, &azblob.UploadStreamOptions{
+		BlockSize:        azureBlockSize,
+		Concurrency:      azureParallelism,
+		HTTPHeaders:      headers,
+		AccessConditions: conditions,
+	})
 	// A racing upload's commit discards this one's staged blocks.
 	if opts.IfAbsent && bloberror.HasCode(err, bloberror.InvalidBlockList) {
-		return fmt.Errorf("%w: %w", ErrObjectExists, wrapAzureError(err))
+		return fmt.Errorf("%w: %w", ErrExists, wrapAzureError(err))
 	}
 	return wrapAzureObjectError(err)
 }
@@ -259,17 +269,37 @@ func (s *azureBLOBStorage) download(ctx context.Context, storagePath string, w i
 	return n, wrapAzureObjectError(err)
 }
 
+// ObjectExists reports a directory of an account with a hierarchical namespace
+// (ADLS Gen2) as no object, as a store reports a prefix.
 func (s *azureBLOBStorage) ObjectExists(ctx context.Context, storagePath string) (bool, error) {
 	blobClient := s.client.ServiceClient().NewContainerClient(s.conf.ContainerName).NewBlobClient(storagePath)
-	_, err := blobClient.GetProperties(ctx, nil)
+	props, err := blobClient.GetProperties(ctx, nil)
 	if bloberror.HasCode(err, bloberror.BlobNotFound) {
 		return false, nil
 	}
-	return err == nil, wrapAzureObjectError(err)
+	if err != nil {
+		return false, wrapAzureObjectError(err)
+	}
+	return !azureFolder(props.Metadata), nil
+}
+
+// azureFolder reports the metadata a hierarchical namespace gives its
+// directories. Metadata keys come back in any case.
+func azureFolder(metadata map[string]*string) bool {
+	for k, v := range metadata {
+		if strings.EqualFold(k, "hdi_isfolder") && v != nil && strings.EqualFold(*v, "true") {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *azureBLOBStorage) ListObjects(ctx context.Context, prefix string) ([]string, error) {
-	pager := s.client.NewListBlobsFlatPager(s.conf.ContainerName, &azblob.ListBlobsFlatOptions{Prefix: &prefix})
+	// With metadata, to leave out a hierarchical namespace's directories.
+	pager := s.client.NewListBlobsFlatPager(s.conf.ContainerName, &azblob.ListBlobsFlatOptions{
+		Prefix:  &prefix,
+		Include: azblob.ListBlobsInclude{Metadata: true},
+	})
 	var keys []string
 	for pager.More() {
 		page, err := pager.NextPage(ctx)
@@ -277,7 +307,9 @@ func (s *azureBLOBStorage) ListObjects(ctx context.Context, prefix string) ([]st
 			return nil, wrapAzureObjectError(err)
 		}
 		for _, item := range page.Segment.BlobItems {
-			keys = append(keys, *item.Name)
+			if item.Name != nil && !azureFolder(item.Metadata) {
+				keys = append(keys, *item.Name)
+			}
 		}
 	}
 	return keys, nil
@@ -285,9 +317,9 @@ func (s *azureBLOBStorage) ListObjects(ctx context.Context, prefix string) ([]st
 
 func (s *azureBLOBStorage) DeleteObjects(ctx context.Context, storagePaths []string) error {
 	for _, p := range storagePaths {
-		_, err := s.client.DeleteBlob(ctx, s.conf.ContainerName, p, &azblob.DeleteBlobOptions{
-			DeleteSnapshots: to.Ptr(azblob.DeleteSnapshotsOptionTypeInclude),
-		})
+		// A blob with snapshots is not deleted, as on Storage before: deleting
+		// someone's snapshots along with it is not this call's to decide.
+		_, err := s.client.DeleteBlob(ctx, s.conf.ContainerName, p, nil)
 		if err != nil && !bloberror.HasCode(err, bloberror.BlobNotFound) {
 			return wrapAzureObjectError(err)
 		}
@@ -295,15 +327,31 @@ func (s *azureBLOBStorage) DeleteObjects(ctx context.Context, storagePaths []str
 	return nil
 }
 
-// GeneratePresignedUrl signs with the account key unless a token credential is
+// PresignedURL signs with the account key unless a token credential is
 // set, in which case it signs with a user delegation key as Storage does.
-func (s *azureBLOBStorage) GeneratePresignedUrl(ctx context.Context, storagePath string, expiration time.Duration) (string, error) {
+func (s *azureBLOBStorage) PresignedURL(ctx context.Context, storagePath string, expiration time.Duration) (string, error) {
 	if s.conf.TokenCredential != nil {
 		return s.presignedUrlWithToken(ctx, storagePath, expiration)
 	}
-	b := s.client.ServiceClient().NewContainerClient(s.conf.ContainerName).NewBlobClient(storagePath)
-	u, err := b.GetSASURL(sas.BlobPermissions{Read: true}, time.Now().Add(expiration), nil)
-	return u, wrapAzureError(err)
+	// HTTPS only, as the user delegation SAS, unless the endpoint itself is
+	// plain HTTP, as an emulator's.
+	protocol := sas.ProtocolHTTPS
+	if strings.HasPrefix(s.serviceURL, "http://") {
+		protocol = sas.ProtocolHTTPSandHTTP
+	}
+	qp, err := sas.BlobSignatureValues{
+		Protocol:      protocol,
+		ExpiryTime:    time.Now().UTC().Add(expiration),
+		Permissions:   (&sas.BlobPermissions{Read: true}).String(),
+		ContainerName: s.conf.ContainerName,
+		BlobName:      storagePath,
+	}.SignWithSharedKey(s.cred)
+	if err != nil {
+		return "", err
+	}
+	u := s.blobURL(storagePath)
+	u.RawQuery = qp.Encode()
+	return u.String(), nil
 }
 
 func wrapAzureObjectError(err error) error {
@@ -311,9 +359,9 @@ func wrapAzureObjectError(err error) error {
 	case err == nil:
 		return nil
 	case bloberror.HasCode(err, bloberror.BlobNotFound):
-		return fmt.Errorf("%w: %w", ErrObjectNotFound, wrapAzureError(err))
+		return fmt.Errorf("%w: %w", ErrNotFound, wrapAzureError(err))
 	case bloberror.HasCode(err, bloberror.BlobAlreadyExists, bloberror.ConditionNotMet):
-		return fmt.Errorf("%w: %w", ErrObjectExists, wrapAzureError(err))
+		return fmt.Errorf("%w: %w", ErrExists, wrapAzureError(err))
 	}
 	return wrapAzureError(err)
 }

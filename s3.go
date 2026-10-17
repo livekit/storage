@@ -18,7 +18,6 @@ import (
 	"bytes"
 	"cmp"
 	"context"
-	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -31,6 +30,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/aws/retry"
+	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/credentials/stscreds"
@@ -82,11 +82,11 @@ func NewS3(conf *S3Config) (Storage, error) {
 		return nil, err
 	}
 
-	if conf.AssumeRoleArn != "" {
+	if conf.AssumeRoleARN != "" {
 		stsSvc := sts.NewFromConfig(*awsConf)
-		cp = stscreds.NewAssumeRoleProvider(stsSvc, conf.AssumeRoleArn, func(o *stscreds.AssumeRoleOptions) {
-			if conf.AssumeRoleExternalId != "" {
-				o.ExternalID = aws.String(conf.AssumeRoleExternalId)
+		cp = stscreds.NewAssumeRoleProvider(stsSvc, conf.AssumeRoleARN, func(o *stscreds.AssumeRoleOptions) {
+			if conf.AssumeRoleExternalID != "" {
+				o.ExternalID = aws.String(conf.AssumeRoleExternalID)
 			}
 		})
 		awsConf, err = getConf(conf, cp)
@@ -129,21 +129,20 @@ func getConf(conf *S3Config, cp aws.CredentialsProvider) (*aws.Config, error) {
 			})
 		}
 
-		s3Transport := transportWithTimeouts(nil)
-		if conf.ProxyConfig != nil {
-			proxyUrl, err := url.Parse(conf.ProxyConfig.Url)
-			if err != nil {
-				return err
-			}
-			s3Transport.Proxy = http.ProxyURL(proxyUrl)
-			if conf.ProxyConfig.Username != "" && conf.ProxyConfig.Password != "" {
-				auth := fmt.Sprintf("%s:%s", conf.ProxyConfig.Username, conf.ProxyConfig.Password)
-				basicAuth := "Basic " + base64.StdEncoding.EncodeToString([]byte(auth))
-				s3Transport.ProxyConnectHeader = http.Header{}
-				s3Transport.ProxyConnectHeader.Add("Proxy-Authorization", basicAuth)
-			}
+		// The SDK's own client, which keeps its pool defaults and is the only
+		// kind a custom CA bundle (AWS_CA_BUNDLE) can be added to.
+		setProxy, err := proxySetter(conf.ProxyConfig)
+		if err != nil {
+			return err
 		}
-		o.HTTPClient = &http.Client{Transport: s3Transport}
+		// The SDK's read timeout is off, as setTimeouts bounds reads and writes.
+		// Legacy defaults keep each client from replacing the dialer, and with
+		// it the idle timeout, as AWS_DEFAULTS_MODE would.
+		o.DefaultsModeOptions.Mode = aws.DefaultsModeLegacy
+		o.HTTPClient = awshttp.NewBuildableClient().
+			WithDialerOptions(setDialTimeouts).
+			WithTransportOptions(setTimeouts, setProxy).
+			WithReadTimeout(0)
 
 		return nil
 	}
@@ -194,13 +193,6 @@ func (s *s3Storage) getClient(l logging.Logger) *s3.Client {
 	})
 }
 
-func (s *s3Storage) UploadData(ctx context.Context, data []byte, storagePath, contentType string) (string, int64, error) {
-	if err := s.upload(ctx, bytes.NewReader(data), storagePath, contentType); err != nil {
-		return "", 0, err
-	}
-	return s.location(storagePath), int64(len(data)), nil
-}
-
 func (s *s3Storage) UploadFile(ctx context.Context, filepath, storagePath, contentType string) (string, int64, error) {
 	file, err := os.Open(filepath)
 	if err != nil {
@@ -219,7 +211,7 @@ func (s *s3Storage) UploadFile(ctx context.Context, filepath, storagePath, conte
 }
 
 func (s *s3Storage) upload(ctx context.Context, body io.Reader, storagePath, contentType string) error {
-	l := NewS3Logger()
+	l := news3Logger()
 	if _, err := s.uploader(s.getClient(l)).Upload(ctx, s.putInput(storagePath, body, PutOptions{ContentType: contentType})); err != nil {
 		l.WriteLogs()
 		return wrapS3Error(err)
@@ -275,7 +267,6 @@ func (s *s3Storage) location(storagePath string) string {
 	return loc.String()
 }
 
-// DownloadFile fetches ranges in parallel into the file.
 func (s *s3Storage) DownloadFile(ctx context.Context, filepath, storagePath string) (int64, error) {
 	file, err := os.Create(filepath)
 	if err != nil {
@@ -283,7 +274,12 @@ func (s *s3Storage) DownloadFile(ctx context.Context, filepath, storagePath stri
 	}
 	defer file.Close()
 
-	n, err := manager.NewDownloader(s.getClient(nil)).Download(ctx, file, &s3.GetObjectInput{
+	return s.downloadRanges(ctx, file, storagePath)
+}
+
+// downloadRanges fetches the object in parallel ranges, each retried on its own.
+func (s *s3Storage) downloadRanges(ctx context.Context, w io.WriterAt, storagePath string) (int64, error) {
+	n, err := manager.NewDownloader(s.getClient(nil)).Download(ctx, w, &s3.GetObjectInput{
 		Bucket: aws.String(s.conf.Bucket),
 		Key:    aws.String(storagePath),
 	})
@@ -302,44 +298,21 @@ func (s *s3Storage) PutObject(ctx context.Context, storagePath string, data []by
 }
 
 // UploadObject checks IfAbsent before uploading, which spares a refused upload
-// its traffic, and again when it completes.
+// its traffic, and in the request that completes it: the uploader copies the
+// input's IfNoneMatch into PutObject or CompleteMultipartUpload.
 func (s *s3Storage) UploadObject(ctx context.Context, storagePath string, body io.Reader, opts PutOptions) error {
-	if opts.IfAbsent {
-		exists, err := s.ObjectExists(ctx, storagePath)
-		if err != nil {
-			return err
-		}
-		if exists {
-			return ErrObjectExists
-		}
+	if opts.IfAbsent && presentBeforeUpload(ctx, s, storagePath) {
+		return ErrExists
 	}
 	input := s.putInput(storagePath, body, opts)
 	uploader := s.uploader(s.getClient(nil), func(u *manager.Uploader) {
 		u.PartSize = s3UploadPartSize
-		if opts.IfAbsent {
-			// A body that fits one part goes up as this PutObject; a larger one
-			// is completed with the same condition, which the uploader drops.
-			input.IfNoneMatch = aws.String("*")
-			u.ClientOptions = append(u.ClientOptions, completeIfAbsent)
-		}
 	})
+	if opts.IfAbsent {
+		input.IfNoneMatch = aws.String("*")
+	}
 	_, err := uploader.Upload(ctx, input)
 	return wrapS3ObjectError(err)
-}
-
-func completeIfAbsent(o *s3.Options) {
-	o.APIOptions = append(o.APIOptions, func(stack *middleware.Stack) error {
-		return stack.Initialize.Add(middleware.InitializeMiddlewareFunc("CompleteIfAbsent",
-			func(ctx context.Context, in middleware.InitializeInput, next middleware.InitializeHandler) (
-				middleware.InitializeOutput, middleware.Metadata, error,
-			) {
-				if v, ok := in.Parameters.(*s3.CompleteMultipartUploadInput); ok {
-					v.IfNoneMatch = aws.String("*")
-				}
-				return next.HandleInitialize(ctx, in)
-			},
-		), middleware.Before)
-	})
 }
 
 // putInput is every write's request: the content type, and the metadata,
@@ -362,7 +335,11 @@ func (s *s3Storage) putInput(storagePath string, body io.Reader, opts PutOptions
 }
 
 func (s *s3Storage) GetObject(ctx context.Context, storagePath string) ([]byte, error) {
-	return getObject(ctx, s, storagePath)
+	w := manager.NewWriteAtBuffer(nil)
+	if _, err := s.downloadRanges(ctx, w, storagePath); err != nil {
+		return nil, err
+	}
+	return w.Bytes(), nil
 }
 
 func (s *s3Storage) GetObjectRange(ctx context.Context, storagePath string, offset, length int64) ([]byte, error) {
@@ -407,7 +384,7 @@ func (s *s3Storage) ObjectExists(ctx context.Context, storagePath string) (bool,
 		Key:    aws.String(storagePath),
 	})
 	err = wrapS3ObjectError(err)
-	if errors.Is(err, ErrObjectNotFound) {
+	if errors.Is(err, ErrNotFound) {
 		return false, nil
 	}
 	return err == nil, err
@@ -451,16 +428,22 @@ func (s *s3Storage) DeleteObjects(ctx context.Context, storagePaths []string) er
 		if err != nil {
 			return wrapS3Error(err)
 		}
-		if len(out.Errors) > 0 {
-			e := out.Errors[0]
-			return fmt.Errorf("storage: %d of %d deletes failed, first %s: %s %s",
-				len(out.Errors), len(batch), aws.ToString(e.Key), aws.ToString(e.Code), aws.ToString(e.Message))
+		// Any key the store reports that is not already gone is still there,
+		// so the call fails rather than leave it behind unseen.
+		var errs []error
+		for _, e := range out.Errors {
+			if aws.ToString(e.Code) != "NoSuchKey" {
+				errs = append(errs, fmt.Errorf("storage: delete %s: %s %s", aws.ToString(e.Key), aws.ToString(e.Code), aws.ToString(e.Message)))
+			}
+		}
+		if err := errors.Join(errs...); err != nil {
+			return err
 		}
 	}
 	return nil
 }
 
-func (s *s3Storage) GeneratePresignedUrl(ctx context.Context, storagePath string, expiration time.Duration) (string, error) {
+func (s *s3Storage) PresignedURL(ctx context.Context, storagePath string, expiration time.Duration) (string, error) {
 	res, err := s3.NewPresignClient(s.getClient(nil)).PresignGetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(s.conf.Bucket),
 		Key:    aws.String(storagePath),
@@ -471,7 +454,7 @@ func (s *s3Storage) GeneratePresignedUrl(ctx context.Context, storagePath string
 	return res.URL, nil
 }
 
-// wrapS3ObjectError is wrapS3Error with ErrObjectNotFound and ErrObjectExists
+// wrapS3ObjectError is wrapS3Error with ErrNotFound and ErrExists
 // for the codes S3-compatible stores answer them with.
 func wrapS3ObjectError(err error) error {
 	if err == nil {
@@ -480,15 +463,15 @@ func wrapS3ObjectError(err error) error {
 	var noSuchKey *types.NoSuchKey
 	var notFound *types.NotFound
 	if errors.As(err, &noSuchKey) || errors.As(err, &notFound) {
-		return fmt.Errorf("%w: %w", ErrObjectNotFound, wrapS3Error(err))
+		return fmt.Errorf("%w: %w", ErrNotFound, wrapS3Error(err))
 	}
 	var apiErr smithy.APIError
 	if errors.As(err, &apiErr) {
 		switch apiErr.ErrorCode() {
 		case "NoSuchKey", "NotFound", "404":
-			return fmt.Errorf("%w: %w", ErrObjectNotFound, wrapS3Error(err))
+			return fmt.Errorf("%w: %w", ErrNotFound, wrapS3Error(err))
 		case "PreconditionFailed":
-			return fmt.Errorf("%w: %w", ErrObjectExists, wrapS3Error(err))
+			return fmt.Errorf("%w: %w", ErrExists, wrapS3Error(err))
 		}
 	}
 	return wrapS3Error(err)

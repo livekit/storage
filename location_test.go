@@ -377,7 +377,16 @@ func TestLocalLocation(t *testing.T) {
 	}
 	for _, tc := range cases {
 		u := &localUploader{StorageDir: tc.storageDir}
-		require.Equal(t, tc.want, u.location(tc.storagePath))
+		got, err := u.file(tc.storagePath)
+		require.NoError(t, err)
+		require.Equal(t, tc.want, got)
+	}
+
+	// No key reaches outside the directory or names the directory itself.
+	u := &localUploader{StorageDir: "/var/storage"}
+	for _, key := range []string{"", ".", "/", "..", "../x", "a/../../x", "a/.."} {
+		_, err := u.file(key)
+		require.Error(t, err, key)
 	}
 }
 

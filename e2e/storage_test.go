@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package storage_test
+package e2e
 
 import (
 	"bytes"
@@ -22,6 +22,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -93,6 +94,8 @@ func TestGCP(t *testing.T) {
 }
 
 func TestLocal(t *testing.T) {
+	// An empty StorageDir is the working directory.
+	t.Chdir(t.TempDir())
 	s, err := storage.New(&storage.LocalConfig{})
 	require.NoError(t, err)
 
@@ -212,7 +215,7 @@ func testStorage(t *testing.T, s storage.Storage) {
 	pathBulk1 := prefix + "-bulk-1.txt"
 	pathBulk2 := prefix + "-bulk-2.txt"
 
-	dataPayload := []byte("hello from UploadData")
+	dataPayload := []byte("hello from PutObject")
 	filePayload := []byte("hello from UploadFile")
 	bulk1Payload := []byte("bulk delete 1")
 	bulk2Payload := []byte("bulk delete 2")
@@ -222,11 +225,8 @@ func testStorage(t *testing.T, s storage.Storage) {
 		_ = s.DeleteObjects(context.Background(), []string{pathData, pathFile, pathBulk1, pathBulk2})
 	})
 
-	t.Run("UploadData", func(t *testing.T) {
-		loc, size, err := s.UploadData(context.Background(), dataPayload, pathData, "text/plain")
-		require.NoError(t, err)
-		require.Equal(t, int64(len(dataPayload)), size)
-		assertLocation(t, loc, pathData)
+	t.Run("PutObject", func(t *testing.T) {
+		require.NoError(t, s.PutObject(context.Background(), pathData, dataPayload, storage.PutOptions{ContentType: "text/plain"}))
 	})
 
 	t.Run("UploadFile", func(t *testing.T) {
@@ -274,14 +274,9 @@ func testStorage(t *testing.T, s storage.Storage) {
 		require.Equal(t, filePayload, got)
 	})
 
-	t.Run("GeneratePresignedUrl", func(t *testing.T) {
-		rawURL, err := s.GeneratePresignedUrl(context.Background(), pathData, 5*time.Minute)
-		if err != nil {
-			// Some configurations (e.g. Azure without OAuth) don't support presigning;
-			// the method exists and reported a clear error, which is the contract.
-			t.Logf("presigned URL not available in this config: %v", err)
-			return
-		}
+	t.Run("PresignedURL", func(t *testing.T) {
+		rawURL, err := s.PresignedURL(context.Background(), pathData, 5*time.Minute)
+		require.NoError(t, err)
 		require.NotEmpty(t, rawURL)
 
 		// The URL should at least be parseable and reference the key we asked for.
@@ -314,10 +309,8 @@ func testStorage(t *testing.T, s storage.Storage) {
 
 	t.Run("DeleteObjects", func(t *testing.T) {
 		// Upload two more objects, then bulk-delete them along with the leftover pathFile.
-		_, _, err := s.UploadData(context.Background(), bulk1Payload, pathBulk1, "text/plain")
-		require.NoError(t, err)
-		_, _, err = s.UploadData(context.Background(), bulk2Payload, pathBulk2, "text/plain")
-		require.NoError(t, err)
+		require.NoError(t, s.PutObject(context.Background(), pathBulk1, bulk1Payload, storage.PutOptions{}))
+		require.NoError(t, s.PutObject(context.Background(), pathBulk2, bulk2Payload, storage.PutOptions{}))
 
 		require.NoError(t, s.DeleteObjects(context.Background(), []string{pathFile, pathBulk1, pathBulk2}))
 
@@ -332,14 +325,16 @@ func testStorage(t *testing.T, s storage.Storage) {
 			_ = s.DeleteObjects(context.Background(), []string{pathMultipart})
 		})
 
-		// 6 MiB exceeds the S3 manager's default 5 MiB part size, forcing the
-		// multipart upload path (CreateMultipartUpload / UploadPart / Complete).
-		payload := make([]byte, 6<<20)
+		// 17 MiB is more than one 16 MiB part on S3, and more than one ranged
+		// GET reads it back.
+		payload := make([]byte, 17<<20)
 		for i := range payload {
 			payload[i] = byte(i)
 		}
+		file := filepath.Join(t.TempDir(), "multipart")
+		require.NoError(t, os.WriteFile(file, payload, 0o600))
 
-		loc, size, err := s.UploadData(context.Background(), payload, pathMultipart, "application/octet-stream")
+		loc, size, err := s.UploadFile(context.Background(), file, pathMultipart, "application/octet-stream")
 		require.NoError(t, err)
 		require.Equal(t, int64(len(payload)), size)
 		assertLocation(t, loc, pathMultipart)
@@ -360,7 +355,7 @@ func hasSuffixIn(items []string, suffix string) bool {
 	return false
 }
 
-// assertLocation verifies the URL returned by UploadData/UploadFile is non-empty,
+// assertLocation verifies the URL returned by UploadFile is non-empty,
 // parseable, and references the key we just uploaded.
 func assertLocation(t *testing.T, loc, key string) {
 	t.Helper()
