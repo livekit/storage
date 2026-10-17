@@ -15,9 +15,12 @@
 package storage
 
 import (
+	"sync/atomic"
+
 	"bytes"
 	"context"
 	"encoding/base64"
+	"golang.org/x/sync/errgroup"
 	"net"
 	"net/http"
 	"net/url"
@@ -67,6 +70,35 @@ const (
 	dialTimeout         = 30 * time.Second
 	tlsHandshakeTimeout = 10 * time.Second
 )
+
+// deleteConcurrency is how many deletes a DeleteObjects sends at once where a
+// store takes one object per request (GCS, Azure, OCI): sequential, a large
+// delete is one round trip per object.
+const deleteConcurrency = 16
+
+// deleteEach deletes every path with del, deleteConcurrency at a time, and
+// returns the first error. A failure stops new deletes but lets those in
+// flight finish, rather than cancel them: an OCI call canceled mid-flight
+// races inside the SDK. A retry is safe, as del treats a missing path as
+// deleted.
+func deleteEach(ctx context.Context, paths []string, del func(ctx context.Context, path string) error) error {
+	var g errgroup.Group
+	g.SetLimit(deleteConcurrency)
+	var failed atomic.Bool
+	for _, p := range paths {
+		if failed.Load() {
+			break
+		}
+		g.Go(func() error {
+			err := del(ctx, p)
+			if err != nil {
+				failed.Store(true)
+			}
+			return err
+		})
+	}
+	return g.Wait()
+}
 
 // idleTimeout is how long a connection may move no bytes either way. A store
 // can take minutes to answer a large commit.

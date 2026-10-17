@@ -270,12 +270,12 @@ func (s *gcpStorage) ListObjects(ctx context.Context, prefix string) ([]string, 
 }
 
 func (s *gcpStorage) DeleteObjects(ctx context.Context, storagePaths []string) error {
-	for _, p := range storagePaths {
+	return deleteEach(ctx, storagePaths, func(ctx context.Context, p string) error {
 		if err := s.object(p).Delete(ctx); err != nil && !errors.Is(err, storage.ErrObjectNotExist) {
 			return wrapGCPObjectError(err)
 		}
-	}
-	return nil
+		return nil
+	})
 }
 
 func (s *gcpStorage) PresignedURL(_ context.Context, storagePath string, expiration time.Duration) (string, error) {

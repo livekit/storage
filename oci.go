@@ -426,7 +426,7 @@ func (s *ociStorage) ListObjects(ctx context.Context, prefix string) ([]string, 
 }
 
 func (s *ociStorage) DeleteObjects(ctx context.Context, storagePaths []string) error {
-	for _, p := range storagePaths {
+	return deleteEach(ctx, storagePaths, func(ctx context.Context, p string) error {
 		_, err := s.client.DeleteObject(ctx, objectstorage.DeleteObjectRequest{
 			NamespaceName: &s.namespace,
 			BucketName:    &s.conf.Bucket,
@@ -435,8 +435,8 @@ func (s *ociStorage) DeleteObjects(ctx context.Context, storagePaths []string) e
 		if err = wrapOCIObjectError(err); err != nil && !errors.Is(err, ErrNotFound) {
 			return err
 		}
-	}
-	return nil
+		return nil
+	})
 }
 
 func (s *ociStorage) PresignedURL(ctx context.Context, storagePath string, expiration time.Duration) (string, error) {

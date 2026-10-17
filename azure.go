@@ -315,16 +315,16 @@ func (s *azureBLOBStorage) ListObjects(ctx context.Context, prefix string) ([]st
 	return keys, nil
 }
 
+// DeleteObjects fails on a blob with snapshots, as on main: deleting someone's
+// snapshots along with it is not this call's to decide.
 func (s *azureBLOBStorage) DeleteObjects(ctx context.Context, storagePaths []string) error {
-	for _, p := range storagePaths {
-		// A blob with snapshots is not deleted, as on Storage before: deleting
-		// someone's snapshots along with it is not this call's to decide.
+	return deleteEach(ctx, storagePaths, func(ctx context.Context, p string) error {
 		_, err := s.client.DeleteBlob(ctx, s.conf.ContainerName, p, nil)
 		if err != nil && !bloberror.HasCode(err, bloberror.BlobNotFound) {
 			return wrapAzureObjectError(err)
 		}
-	}
-	return nil
+		return nil
+	})
 }
 
 // PresignedURL signs with the account key unless a token credential is

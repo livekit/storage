@@ -39,7 +39,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
 	"github.com/aws/smithy-go"
-	"github.com/aws/smithy-go/logging"
 	"github.com/aws/smithy-go/middleware"
 )
 
@@ -60,8 +59,8 @@ func wrapS3Error(err error) error {
 const defaultBucketLocation = "us-east-1"
 
 type s3Storage struct {
-	conf    *S3Config
-	awsConf *aws.Config
+	conf   *S3Config
+	client *s3.Client
 }
 
 func NewS3(conf *S3Config) (Storage, error) {
@@ -102,8 +101,8 @@ func NewS3(conf *S3Config) (Storage, error) {
 	}
 
 	return &s3Storage{
-		conf:    conf,
-		awsConf: awsConf,
+		conf:   conf,
+		client: newS3Client(awsConf, conf),
 	}, nil
 }
 
@@ -135,10 +134,14 @@ func getConf(conf *S3Config, cp aws.CredentialsProvider) (*aws.Config, error) {
 		if err != nil {
 			return err
 		}
-		// The SDK's read timeout is off, as setTimeouts bounds reads and writes.
-		// Legacy defaults keep each client from replacing the dialer, and with
-		// it the idle timeout, as AWS_DEFAULTS_MODE would.
+		// "Legacy" is the SDK's default when AWS_DEFAULTS_MODE is unset, so
+		// this pins what main ran with. Every other mode only swaps in its own
+		// connect and TLS timeouts (1.1s to 30s), and does it by replacing the
+		// dialer, which drops the idle timeout setTimeouts puts on it. This
+		// package sets those timeouts itself, and retries with its own retryer,
+		// which no mode changes.
 		o.DefaultsModeOptions.Mode = aws.DefaultsModeLegacy
+		// The SDK's read timeout is off: setTimeouts bounds reads and writes.
 		o.HTTPClient = awshttp.NewBuildableClient().
 			WithDialerOptions(setDialTimeouts).
 			WithTransportOptions(setTimeouts, setProxy).
@@ -176,16 +179,13 @@ func updateRegion(awsConf *aws.Config, bucket string) error {
 	return nil
 }
 
-func (s *s3Storage) getClient(l logging.Logger) *s3.Client {
-	return s3.NewFromConfig(*s.awsConf, func(o *s3.Options) {
-		if l != nil {
-			o.Logger = l
-			o.ClientLogMode = aws.LogRequest | aws.LogResponse | aws.LogRetries
-		}
+// newS3Client is the one client a Storage sends with, so calls share its
+// connections.
+func newS3Client(awsConf *aws.Config, conf *S3Config) *s3.Client {
+	return s3.NewFromConfig(*awsConf, func(o *s3.Options) {
+		o.UsePathStyle = conf.ForcePathStyle
 
-		o.UsePathStyle = s.conf.ForcePathStyle
-
-		if s.conf.Endpoint != "" {
+		if conf.Endpoint != "" {
 			// needed for compatibility with non-AWS S3-compatible providers (Oracle, etc.)
 			o.RequestChecksumCalculation = aws.RequestChecksumCalculationWhenRequired
 			o.ResponseChecksumValidation = aws.ResponseChecksumValidationWhenRequired
@@ -211,8 +211,15 @@ func (s *s3Storage) UploadFile(ctx context.Context, filepath, storagePath, conte
 }
 
 func (s *s3Storage) upload(ctx context.Context, body io.Reader, storagePath, contentType string) error {
+	// The SDK's request log is kept, and written only when the upload fails.
 	l := news3Logger()
-	if _, err := s.uploader(s.getClient(l)).Upload(ctx, s.putInput(storagePath, body, PutOptions{ContentType: contentType})); err != nil {
+	logTo := func(u *manager.Uploader) {
+		u.ClientOptions = append(u.ClientOptions, func(o *s3.Options) {
+			o.Logger = l
+			o.ClientLogMode = aws.LogRequest | aws.LogResponse | aws.LogRetries
+		})
+	}
+	if _, err := s.uploader(s.client, logTo).Upload(ctx, s.putInput(storagePath, body, PutOptions{ContentType: contentType})); err != nil {
 		l.WriteLogs()
 		return wrapS3Error(err)
 	}
@@ -279,7 +286,7 @@ func (s *s3Storage) DownloadFile(ctx context.Context, filepath, storagePath stri
 
 // downloadRanges fetches the object in parallel ranges, each retried on its own.
 func (s *s3Storage) downloadRanges(ctx context.Context, w io.WriterAt, storagePath string) (int64, error) {
-	n, err := manager.NewDownloader(s.getClient(nil)).Download(ctx, w, &s3.GetObjectInput{
+	n, err := manager.NewDownloader(s.client).Download(ctx, w, &s3.GetObjectInput{
 		Bucket: aws.String(s.conf.Bucket),
 		Key:    aws.String(storagePath),
 	})
@@ -293,7 +300,7 @@ func (s *s3Storage) PutObject(ctx context.Context, storagePath string, data []by
 	if opts.IfAbsent {
 		input.IfNoneMatch = aws.String("*")
 	}
-	_, err := s.getClient(nil).PutObject(ctx, input)
+	_, err := s.client.PutObject(ctx, input)
 	return wrapS3ObjectError(err)
 }
 
@@ -305,7 +312,7 @@ func (s *s3Storage) UploadObject(ctx context.Context, storagePath string, body i
 		return ErrExists
 	}
 	input := s.putInput(storagePath, body, opts)
-	uploader := s.uploader(s.getClient(nil), func(u *manager.Uploader) {
+	uploader := s.uploader(s.client, func(u *manager.Uploader) {
 		u.PartSize = s3UploadPartSize
 	})
 	if opts.IfAbsent {
@@ -346,7 +353,7 @@ func (s *s3Storage) GetObjectRange(ctx context.Context, storagePath string, offs
 	if offset < 0 || length <= 0 {
 		return nil, fmt.Errorf("storage: invalid range offset %d length %d", offset, length)
 	}
-	out, err := s.getClient(nil).GetObject(ctx, &s3.GetObjectInput{
+	out, err := s.client.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(s.conf.Bucket),
 		Key:    aws.String(storagePath),
 		Range:  aws.String(fmt.Sprintf("bytes=%d-%d", offset, offset+length-1)),
@@ -367,7 +374,7 @@ func (s *s3Storage) GetObjectRange(ctx context.Context, storagePath string, offs
 }
 
 func (s *s3Storage) DownloadObject(ctx context.Context, storagePath string, w io.Writer) (int64, error) {
-	out, err := s.getClient(nil).GetObject(ctx, &s3.GetObjectInput{
+	out, err := s.client.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(s.conf.Bucket),
 		Key:    aws.String(storagePath),
 	})
@@ -379,7 +386,7 @@ func (s *s3Storage) DownloadObject(ctx context.Context, storagePath string, w io
 }
 
 func (s *s3Storage) ObjectExists(ctx context.Context, storagePath string) (bool, error) {
-	_, err := s.getClient(nil).HeadObject(ctx, &s3.HeadObjectInput{
+	_, err := s.client.HeadObject(ctx, &s3.HeadObjectInput{
 		Bucket: aws.String(s.conf.Bucket),
 		Key:    aws.String(storagePath),
 	})
@@ -392,7 +399,7 @@ func (s *s3Storage) ObjectExists(ctx context.Context, storagePath string) (bool,
 
 func (s *s3Storage) ListObjects(ctx context.Context, prefix string) ([]string, error) {
 	var keys []string
-	paginator := s3.NewListObjectsV2Paginator(s.getClient(nil), &s3.ListObjectsV2Input{
+	paginator := s3.NewListObjectsV2Paginator(s.client, &s3.ListObjectsV2Input{
 		Bucket: aws.String(s.conf.Bucket),
 		Prefix: aws.String(prefix),
 	})
@@ -410,7 +417,7 @@ func (s *s3Storage) ListObjects(ctx context.Context, prefix string) ([]string, e
 
 // DeleteObjects fails when any key fails, even within a batch S3 accepted.
 func (s *s3Storage) DeleteObjects(ctx context.Context, storagePaths []string) error {
-	client := s.getClient(nil)
+	client := s.client
 	for i := 0; i < len(storagePaths); i += 1000 {
 		batch := storagePaths[i:min(i+1000, len(storagePaths))]
 		objects := make([]types.ObjectIdentifier, 0, len(batch))
@@ -444,7 +451,7 @@ func (s *s3Storage) DeleteObjects(ctx context.Context, storagePaths []string) er
 }
 
 func (s *s3Storage) PresignedURL(ctx context.Context, storagePath string, expiration time.Duration) (string, error) {
-	res, err := s3.NewPresignClient(s.getClient(nil)).PresignGetObject(ctx, &s3.GetObjectInput{
+	res, err := s3.NewPresignClient(s.client).PresignGetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(s.conf.Bucket),
 		Key:    aws.String(storagePath),
 	}, s3.WithPresignExpires(expiration))
