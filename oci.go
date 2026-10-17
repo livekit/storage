@@ -37,6 +37,8 @@ type ociStorage struct {
 	client    objectstorage.ObjectStorageClient
 	namespace string
 	host      string
+	// insecure is an http:// Endpoint, such as an emulator's.
+	insecure bool
 }
 
 func NewOCI(conf *OCIConfig) (Storage, error) {
@@ -65,6 +67,7 @@ func NewOCI(conf *OCIConfig) (Storage, error) {
 	// The SDK only prepends a scheme to client.Host on the first request, so
 	// read it before GetNamespace below.
 	host := strings.TrimPrefix(client.Host, "https://")
+	insecure := strings.HasPrefix(host, "http://")
 	host = strings.TrimPrefix(host, "http://")
 
 	s := &ociStorage{
@@ -72,6 +75,7 @@ func NewOCI(conf *OCIConfig) (Storage, error) {
 		client:    client,
 		namespace: conf.Namespace,
 		host:      host,
+		insecure:  insecure,
 	}
 
 	if s.namespace == "" {
@@ -137,11 +141,15 @@ func (s *ociStorage) UploadFile(ctx context.Context, filepath, storagePath, cont
 }
 
 func (s *ociStorage) location(storagePath string) string {
-	return (&url.URL{
-		Scheme: "https",
-		Host:   s.host,
-		Path:   path.Join("/n", s.namespace, "b", s.conf.Bucket, "o", storagePath),
-	}).String()
+	return s.url(path.Join("/n", s.namespace, "b", s.conf.Bucket, "o", storagePath))
+}
+
+func (s *ociStorage) url(p string) string {
+	scheme := "https"
+	if s.insecure {
+		scheme = "http"
+	}
+	return (&url.URL{Scheme: scheme, Host: s.host, Path: p}).String()
 }
 
 func (s *ociStorage) DownloadFile(ctx context.Context, filepath, storagePath string) (int64, error) {
@@ -176,11 +184,7 @@ func (s *ociStorage) presignedUrl(ctx context.Context, storagePath string, expir
 		return "", wrapOCIError(err)
 	}
 
-	return (&url.URL{
-		Scheme: "https",
-		Host:   s.host,
-		Path:   *resp.AccessUri,
-	}).String(), nil
+	return s.url(*resp.AccessUri), nil
 }
 
 func wrapOCIError(err error) error {
@@ -223,6 +227,18 @@ func (s *ociStorage) PutObject(ctx context.Context, storagePath string, data []b
 // multipart upload of sequential parts through one buffer. IfAbsent is checked
 // at create and again at commit, so it is atomic here.
 func (s *ociStorage) UploadObject(ctx context.Context, storagePath string, body io.Reader, opts PutOptions) error {
+	// The condition is checked again at create and commit; this check spares a
+	// refused upload its traffic, and refuses it where a store ignores
+	// if-none-match on multipart uploads, as floci-oci does.
+	if opts.IfAbsent {
+		exists, err := s.ObjectExists(ctx, storagePath)
+		if err != nil {
+			return err
+		}
+		if exists {
+			return ErrObjectExists
+		}
+	}
 	part := make([]byte, ociUploadPartSize)
 	n, err := io.ReadFull(body, part)
 	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
@@ -315,6 +331,18 @@ func (s *ociStorage) GetObjectRange(ctx context.Context, storagePath string, off
 	var se common.ServiceError
 	if errors.As(err, &se) && se.GetHTTPStatusCode() == http.StatusRequestedRangeNotSatisfiable {
 		return []byte{}, nil
+	}
+	// A range starting at the end can also come back 400 InvalidParameter, as on
+	// floci-oci; the object's size tells it from a bad request.
+	if errors.As(err, &se) && se.GetHTTPStatusCode() == http.StatusBadRequest {
+		head, headErr := s.client.HeadObject(ctx, objectstorage.HeadObjectRequest{
+			NamespaceName: &s.namespace,
+			BucketName:    &s.conf.Bucket,
+			ObjectName:    &storagePath,
+		})
+		if headErr == nil && head.ContentLength != nil && offset >= *head.ContentLength {
+			return []byte{}, nil
+		}
 	}
 	if err != nil {
 		return nil, err

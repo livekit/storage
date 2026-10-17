@@ -24,11 +24,13 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strings"
 	"time"
 
 	"cloud.google.com/go/storage"
 	"github.com/googleapis/gax-go/v2"
 	"golang.org/x/oauth2/google"
+	"golang.org/x/oauth2/jwt"
 	"google.golang.org/api/googleapi"
 	"google.golang.org/api/iterator"
 	"google.golang.org/api/option"
@@ -59,6 +61,10 @@ func wrapGCPError(err error) error {
 type gcpStorage struct {
 	conf   *GCPConfig
 	client *storage.Client
+	// signer is CredentialsJSON's service account, which signs URLs: with the
+	// credentials passed as a token source, the SDK finds no signer of its own
+	// off GCE.
+	signer *jwt.Config
 }
 
 func NewGCP(conf *GCPConfig) (Storage, error) {
@@ -72,7 +78,16 @@ func NewGCP(conf *GCPConfig) (Storage, error) {
 		if err != nil {
 			return nil, err
 		}
-		opts = append(opts, option.WithTokenSource(jwtConfig.TokenSource(context.Background())))
+		u.signer = jwtConfig
+		if conf.Endpoint == "" {
+			opts = append(opts, option.WithTokenSource(jwtConfig.TokenSource(context.Background())))
+		}
+	}
+	if conf.Endpoint != "" {
+		opts = append(opts,
+			option.WithEndpoint(strings.TrimSuffix(conf.Endpoint, "/")+"/storage/v1/"),
+			option.WithoutAuthentication(),
+		)
 	}
 
 	defaultTransport := http.DefaultTransport.(*http.Transport)
@@ -146,10 +161,19 @@ func (s *gcpStorage) location(storagePath string) string {
 }
 
 func (s *gcpStorage) presignedUrl(storagePath string, expiration time.Duration) (string, error) {
-	u, err := s.client.Bucket(s.conf.Bucket).SignedURL(storagePath, &storage.SignedURLOptions{
-		Method:  "GET",
-		Expires: time.Now().Add(expiration),
-	})
+	// V4, which the SDK can address to an http:// emulator, signs for at most 7
+	// days.
+	opts := &storage.SignedURLOptions{
+		Scheme:   storage.SigningSchemeV4,
+		Method:   "GET",
+		Expires:  time.Now().Add(expiration),
+		Insecure: strings.HasPrefix(s.conf.Endpoint, "http://"),
+	}
+	if s.signer != nil {
+		opts.GoogleAccessID = s.signer.Email
+		opts.PrivateKey = s.signer.PrivateKey
+	}
+	u, err := s.client.Bucket(s.conf.Bucket).SignedURL(storagePath, opts)
 	if err != nil {
 		return "", wrapGCPError(err)
 	}

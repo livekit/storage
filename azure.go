@@ -63,7 +63,10 @@ func NewAzure(conf *AzureConfig) (Storage, error) {
 		return nil, err
 	}
 
-	serviceUrl := fmt.Sprintf("https://%s.blob.core.windows.net/", conf.AccountName)
+	serviceUrl := azureServiceURL(conf)
+	if _, err := url.Parse(serviceUrl); err != nil {
+		return nil, fmt.Errorf("azure endpoint: %w", err)
+	}
 	client, err := azblob.NewClientWithSharedKeyCredential(serviceUrl, cred, nil)
 	if err != nil {
 		return nil, err
@@ -77,11 +80,22 @@ func NewAzure(conf *AzureConfig) (Storage, error) {
 }
 
 func (s *azureBLOBStorage) location(storagePath string) string {
-	return (&url.URL{
-		Scheme: "https",
-		Host:   fmt.Sprintf("%s.blob.core.windows.net", s.conf.AccountName),
-		Path:   path.Join(s.conf.ContainerName, storagePath),
-	}).String()
+	return s.blobURL(storagePath).String()
+}
+
+func azureServiceURL(conf *AzureConfig) string {
+	if conf.Endpoint != "" {
+		return conf.Endpoint
+	}
+	return fmt.Sprintf("https://%s.blob.core.windows.net/", conf.AccountName)
+}
+
+// blobURL is storagePath under the service URL, path-style below an
+// emulator's account segment. NewAzure has checked the URL parses.
+func (s *azureBLOBStorage) blobURL(storagePath string) *url.URL {
+	u, _ := url.Parse(azureServiceURL(s.conf))
+	u.Path = path.Join(u.Path, s.conf.ContainerName, storagePath)
+	return u
 }
 
 func (s *azureBLOBStorage) UploadData(ctx context.Context, data []byte, storagePath, contentType string) (string, int64, error) {
@@ -172,12 +186,8 @@ func (s *azureBLOBStorage) presignedUrlWithToken(ctx context.Context, storagePat
 		return "", err
 	}
 
-	loc := &url.URL{
-		Scheme:   "https",
-		Host:     fmt.Sprintf("%s.blob.core.windows.net", s.conf.AccountName),
-		Path:     path.Join(s.conf.ContainerName, storagePath),
-		RawQuery: qp.Encode(),
-	}
+	loc := s.blobURL(storagePath)
+	loc.RawQuery = qp.Encode()
 	return loc.String(), nil
 }
 
