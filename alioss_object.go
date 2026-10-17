@@ -30,7 +30,7 @@ type aliOSSObjects struct {
 	s *aliOSSStorage
 }
 
-func NewAliOSSObjects(conf *AliOSSConfig) (ObjectStorage, error) {
+func newAliOSSObjects(conf *AliOSSConfig) (ObjectStorage, error) {
 	s, err := NewAliOSS(conf)
 	if err != nil {
 		return nil, err
@@ -58,11 +58,7 @@ func (o *aliOSSObjects) UploadObject(ctx context.Context, storagePath string, bo
 }
 
 func (o *aliOSSObjects) GetObject(ctx context.Context, storagePath string) ([]byte, error) {
-	var buf bytes.Buffer
-	if _, err := o.DownloadObject(ctx, storagePath, &buf); err != nil {
-		return nil, err
-	}
-	return buf.Bytes(), nil
+	return getObject(ctx, o, storagePath)
 }
 
 // GetObjectRange asks for standard range behavior: by default OSS answers an

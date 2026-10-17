@@ -32,7 +32,7 @@ type gcpObjects struct {
 	s *gcpStorage
 }
 
-func NewGCPObjects(conf *GCPConfig) (ObjectStorage, error) {
+func newGCPObjects(conf *GCPConfig) (ObjectStorage, error) {
 	s, err := NewGCP(conf)
 	if err != nil {
 		return nil, err
@@ -89,11 +89,7 @@ func (o *gcpObjects) writeError(err error, ifAbsent bool) error {
 }
 
 func (o *gcpObjects) GetObject(ctx context.Context, storagePath string) ([]byte, error) {
-	var buf bytes.Buffer
-	if _, err := o.DownloadObject(ctx, storagePath, &buf); err != nil {
-		return nil, err
-	}
-	return buf.Bytes(), nil
+	return getObject(ctx, o, storagePath)
 }
 
 func (o *gcpObjects) GetObjectRange(ctx context.Context, storagePath string, offset, length int64) ([]byte, error) {

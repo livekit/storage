@@ -49,9 +49,8 @@ type Storage interface {
 
 type PutOptions struct {
 	ContentType string
-	// IfAbsent fails with ErrExists when the path holds an object. PutObject
-	// checks it atomically. UploadObject checks it before uploading, so two
-	// concurrent uploads to one path can both succeed.
+	// IfAbsent fails with ErrExists when the path holds an object, atomically:
+	// of concurrent writes to one path, one succeeds.
 	IfAbsent bool
 }
 

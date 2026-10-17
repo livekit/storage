@@ -33,7 +33,7 @@ type azureObjects struct {
 	s *azureBLOBStorage
 }
 
-func NewAzureObjects(conf *AzureConfig) (ObjectStorage, error) {
+func newAzureObjects(conf *AzureConfig) (ObjectStorage, error) {
 	s, err := NewAzure(conf)
 	if err != nil {
 		return nil, err
@@ -76,11 +76,7 @@ func (o *azureObjects) UploadObject(ctx context.Context, storagePath string, bod
 }
 
 func (o *azureObjects) GetObject(ctx context.Context, storagePath string) ([]byte, error) {
-	var buf bytes.Buffer
-	if _, err := o.DownloadObject(ctx, storagePath, &buf); err != nil {
-		return nil, err
-	}
-	return buf.Bytes(), nil
+	return getObject(ctx, o, storagePath)
 }
 
 func (o *azureObjects) GetObjectRange(ctx context.Context, storagePath string, offset, length int64) ([]byte, error) {

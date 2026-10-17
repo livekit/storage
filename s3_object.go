@@ -27,6 +27,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
+	"github.com/aws/smithy-go/middleware"
 )
 
 const s3UploadPartSize = 16 << 20
@@ -35,7 +36,7 @@ type s3Objects struct {
 	s *s3Storage
 }
 
-func NewS3Objects(conf *S3Config) (ObjectStorage, error) {
+func newS3Objects(conf *S3Config) (ObjectStorage, error) {
 	s, err := NewS3(conf)
 	if err != nil {
 		return nil, err
@@ -52,6 +53,8 @@ func (o *s3Objects) PutObject(ctx context.Context, storagePath string, data []by
 	return wrapS3ObjectError(err)
 }
 
+// UploadObject checks IfAbsent before uploading, which spares a refused upload
+// its traffic, and again when it completes.
 func (o *s3Objects) UploadObject(ctx context.Context, storagePath string, body io.Reader, opts PutOptions) error {
 	if opts.IfAbsent {
 		exists, err := o.ObjectExists(ctx, storagePath)
@@ -62,11 +65,33 @@ func (o *s3Objects) UploadObject(ctx context.Context, storagePath string, body i
 			return ErrObjectExists
 		}
 	}
+	input := o.putInput(storagePath, body, opts)
 	uploader := o.s.uploader(o.s.getClient(nil), func(u *manager.Uploader) {
 		u.PartSize = s3UploadPartSize
+		if opts.IfAbsent {
+			// A body that fits one part goes up as this PutObject; a larger one
+			// is completed with the same condition, which the uploader drops.
+			input.IfNoneMatch = aws.String("*")
+			u.ClientOptions = append(u.ClientOptions, completeIfAbsent)
+		}
 	})
-	_, err := uploader.Upload(ctx, o.putInput(storagePath, body, opts))
+	_, err := uploader.Upload(ctx, input)
 	return wrapS3ObjectError(err)
+}
+
+func completeIfAbsent(o *s3.Options) {
+	o.APIOptions = append(o.APIOptions, func(stack *middleware.Stack) error {
+		return stack.Initialize.Add(middleware.InitializeMiddlewareFunc("CompleteIfAbsent",
+			func(ctx context.Context, in middleware.InitializeInput, next middleware.InitializeHandler) (
+				middleware.InitializeOutput, middleware.Metadata, error,
+			) {
+				if v, ok := in.Parameters.(*s3.CompleteMultipartUploadInput); ok {
+					v.IfNoneMatch = aws.String("*")
+				}
+				return next.HandleInitialize(ctx, in)
+			},
+		), middleware.Before)
+	})
 }
 
 func (o *s3Objects) putInput(storagePath string, body io.Reader, opts PutOptions) *s3.PutObjectInput {
@@ -82,11 +107,7 @@ func (o *s3Objects) putInput(storagePath string, body io.Reader, opts PutOptions
 }
 
 func (o *s3Objects) GetObject(ctx context.Context, storagePath string) ([]byte, error) {
-	var buf bytes.Buffer
-	if _, err := o.DownloadObject(ctx, storagePath, &buf); err != nil {
-		return nil, err
-	}
-	return buf.Bytes(), nil
+	return getObject(ctx, o, storagePath)
 }
 
 func (o *s3Objects) GetObjectRange(ctx context.Context, storagePath string, offset, length int64) ([]byte, error) {

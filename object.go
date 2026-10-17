@@ -15,6 +15,8 @@
 package storage
 
 import (
+	"bytes"
+	"context"
 	"fmt"
 
 	"github.com/livekit/storage/objects"
@@ -35,18 +37,27 @@ var (
 func NewObjectStorage(conf Config) (ObjectStorage, error) {
 	switch c := conf.(type) {
 	case *AliOSSConfig:
-		return NewAliOSSObjects(c)
+		return newAliOSSObjects(c)
 	case *AzureConfig:
-		return NewAzureObjects(c)
+		return newAzureObjects(c)
 	case *GCPConfig:
-		return NewGCPObjects(c)
+		return newGCPObjects(c)
 	case *LocalConfig:
-		return NewLocalObjects(c)
+		return newLocalObjects(c)
 	case *OCIConfig:
-		return NewOCIObjects(c)
+		return newOCIObjects(c)
 	case *S3Config:
-		return NewS3Objects(c)
+		return newS3Objects(c)
 	default:
 		return nil, fmt.Errorf("object storage is not supported for %T", conf)
 	}
+}
+
+// getObject is GetObject for a backend whose reads are streams.
+func getObject(ctx context.Context, s ObjectStorage, storagePath string) ([]byte, error) {
+	var buf bytes.Buffer
+	if _, err := s.DownloadObject(ctx, storagePath, &buf); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
 }

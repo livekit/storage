@@ -23,14 +23,18 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
 	"time"
 )
+
+const localUploadPrefix = ".upload-"
 
 type localObjects struct {
 	u *localUploader
 }
 
-func NewLocalObjects(conf *LocalConfig) (ObjectStorage, error) {
+func newLocalObjects(conf *LocalConfig) (ObjectStorage, error) {
 	u, err := NewLocal(conf)
 	if err != nil {
 		return nil, err
@@ -49,7 +53,7 @@ func (o *localObjects) UploadObject(_ context.Context, storagePath string, body 
 	if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(dst), ".upload-*")
+	tmp, err := os.CreateTemp(filepath.Dir(dst), localUploadPrefix+"*")
 	if err != nil {
 		return err
 	}
@@ -109,8 +113,13 @@ func (o *localObjects) ObjectExists(_ context.Context, storagePath string) (bool
 	return err == nil, err
 }
 
+// ListObjects leaves out UploadObject's temporary files, in progress or left by
+// a crash.
 func (o *localObjects) ListObjects(_ context.Context, prefix string) ([]string, error) {
-	return o.u.ListObjects(prefix)
+	keys, err := o.u.ListObjects(prefix)
+	return slices.DeleteFunc(keys, func(k string) bool {
+		return strings.HasPrefix(filepath.Base(k), localUploadPrefix)
+	}), err
 }
 
 func (o *localObjects) DeleteObjects(_ context.Context, storagePaths []string) error {

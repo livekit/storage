@@ -34,10 +34,10 @@ type ociObjects struct {
 	client objectstorage.ObjectStorageClient
 }
 
-// NewOCIObjects gives its calls a client of their own without the SDK's 60s
+// newOCIObjects gives its calls a client of their own without the SDK's 60s
 // request timeout, which covers reading a body and would cut a long download:
 // the caller's context bounds each call instead.
-func NewOCIObjects(conf *OCIConfig) (ObjectStorage, error) {
+func newOCIObjects(conf *OCIConfig) (ObjectStorage, error) {
 	s, err := NewOCI(conf)
 	if err != nil {
 		return nil, err
@@ -153,11 +153,7 @@ func (o *ociObjects) uploadParts(ctx context.Context, storagePath string, upload
 }
 
 func (o *ociObjects) GetObject(ctx context.Context, storagePath string) ([]byte, error) {
-	var buf bytes.Buffer
-	if _, err := o.DownloadObject(ctx, storagePath, &buf); err != nil {
-		return nil, err
-	}
-	return buf.Bytes(), nil
+	return getObject(ctx, o, storagePath)
 }
 
 func (o *ociObjects) GetObjectRange(ctx context.Context, storagePath string, offset, length int64) ([]byte, error) {
