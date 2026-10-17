@@ -24,9 +24,11 @@ import (
 	"time"
 )
 
-// Storage is storage for services that keep their own objects: every call
-// takes a context, writes can refuse to replace an object, and reads can take
-// a range or stream to a writer.
+// Storage is for services that keep and manage their own objects, where
+// storage.Storage is for uploading files and handing out their location. Every
+// call takes a context, a write can refuse to replace an object, a read can take
+// a range or stream to any writer, and a missing or existing object comes back
+// as ErrNotFound or ErrExists. storage.Storage stays as it is for its callers.
 type Storage interface {
 	PutObject(ctx context.Context, storagePath string, data []byte, opts PutOptions) error
 	// UploadObject streams body in parts: memory is bounded by the part size
