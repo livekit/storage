@@ -20,13 +20,16 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"net/url"
 	"os"
 	"path"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blob"
@@ -57,29 +60,34 @@ type azureBLOBStorage struct {
 	client     *azblob.Client
 	cred       *azblob.SharedKeyCredential
 	serviceURL string
+	options    policy.ClientOptions
 }
 
+// NewAzure signs requests with the account key, or with TokenCredential
+// where no key is set, as with a managed or workload identity.
 func NewAzure(conf *AzureConfig) (Storage, error) {
-	cred, err := azblob.NewSharedKeyCredential(conf.AccountName, conf.AccountKey)
-	if err != nil {
-		return nil, err
-	}
-
 	serviceURL := azureServiceURL(conf)
 	if _, err := url.Parse(serviceURL); err != nil {
 		return nil, fmt.Errorf("azure endpoint: %w", err)
 	}
-	client, err := azblob.NewClientWithSharedKeyCredential(serviceURL, cred, nil)
-	if err != nil {
-		return nil, err
+	s := &azureBLOBStorage{
+		conf:       conf,
+		serviceURL: serviceURL,
+		// azcore's own transport has no idle timeout, and keeps fewer idle
+		// connections than an upload sends blocks at once.
+		options: policy.ClientOptions{Transport: &http.Client{Transport: transportWithTimeouts(http.DefaultTransport)}},
 	}
 
-	return &azureBLOBStorage{
-		conf:       conf,
-		client:     client,
-		cred:       cred,
-		serviceURL: serviceURL,
-	}, nil
+	var err error
+	if conf.AccountKey == "" && conf.TokenCredential != nil {
+		s.client, err = azblob.NewClient(serviceURL, conf.TokenCredential, &azblob.ClientOptions{ClientOptions: s.options})
+		return s, err
+	}
+	if s.cred, err = azblob.NewSharedKeyCredential(conf.AccountName, conf.AccountKey); err != nil {
+		return nil, err
+	}
+	s.client, err = azblob.NewClientWithSharedKeyCredential(serviceURL, s.cred, &azblob.ClientOptions{ClientOptions: s.options})
+	return s, err
 }
 
 func (s *azureBLOBStorage) location(storagePath string) string {
@@ -101,52 +109,38 @@ func (s *azureBLOBStorage) blobURL(storagePath string) *url.URL {
 	return u
 }
 
-func (s *azureBLOBStorage) UploadFile(ctx context.Context, filepath, storagePath, contentType string) (string, int64, error) {
+func (s *azureBLOBStorage) UploadFile(ctx context.Context, storagePath, filepath string, opts PutOptions) (string, int64, error) {
 	file, err := os.Open(filepath)
 	if err != nil {
 		return "", 0, err
 	}
-	defer func() {
-		_ = file.Close()
-	}()
+	defer file.Close()
 
 	stat, err := file.Stat()
 	if err != nil {
 		return "", 0, err
 	}
-
+	headers, conditions := azureWriteOptions(opts)
 	_, err = s.client.UploadFile(ctx, s.conf.ContainerName, storagePath, file, &azblob.UploadFileOptions{
-		HTTPHeaders: &blob.HTTPHeaders{BlobContentType: &contentType},
-		BlockSize:   azureBlockSize,
-		Concurrency: azureParallelism,
+		HTTPHeaders:      headers,
+		AccessConditions: conditions,
+		BlockSize:        azureBlockSize,
+		Concurrency:      azureParallelism,
 	})
 	if err != nil {
-		return "", 0, wrapAzureError(err)
+		return "", 0, wrapAzureWriteError(err, opts.IfAbsent)
 	}
-
 	return s.location(storagePath), stat.Size(), nil
 }
 
-func (s *azureBLOBStorage) DownloadFile(ctx context.Context, filepath, storagePath string) (int64, error) {
-	file, err := os.Create(filepath)
-	if err != nil {
-		return 0, err
-	}
-	defer file.Close()
-
-	_, err = s.client.DownloadFile(ctx, s.conf.ContainerName, storagePath, file, &azblob.DownloadFileOptions{
-		BlockSize:   azureBlockSize,
-		Concurrency: azureParallelism,
+func (s *azureBLOBStorage) DownloadFile(ctx context.Context, storagePath, filepath string) (int64, error) {
+	return downloadFile(filepath, func(f *os.File) (int64, error) {
+		n, err := s.client.DownloadFile(ctx, s.conf.ContainerName, storagePath, f, &azblob.DownloadFileOptions{
+			BlockSize:   azureBlockSize,
+			Concurrency: azureParallelism,
+		})
+		return n, wrapAzureObjectError(err)
 	})
-	if err != nil {
-		return 0, wrapAzureObjectError(err)
-	}
-
-	stat, err := file.Stat()
-	if err != nil {
-		return 0, err
-	}
-	return stat.Size(), nil
 }
 
 func (s *azureBLOBStorage) presignedUrlWithToken(ctx context.Context, storagePath string, expiration time.Duration) (string, error) {
@@ -157,13 +151,15 @@ func (s *azureBLOBStorage) presignedUrlWithToken(ctx context.Context, storagePat
 	now := time.Now().UTC()
 	exp := now.Add(expiration)
 
-	svcClient, err := service.NewClient(s.serviceURL, s.conf.TokenCredential, nil)
+	svcClient, err := service.NewClient(s.serviceURL, s.conf.TokenCredential, &service.ClientOptions{ClientOptions: s.options})
 	if err != nil {
 		return "", err
 	}
 
+	// The key starts in the past and the SAS takes no start time, as Azure
+	// advises: a host clock ahead of Azure's would make the URL not valid yet.
 	udc, err := svcClient.GetUserDelegationCredential(ctx, service.KeyInfo{
-		Start:  to.Ptr(now.Format(sas.TimeFormat)),
+		Start:  to.Ptr(now.Add(-15 * time.Minute).Format(sas.TimeFormat)),
 		Expiry: to.Ptr(exp.Format(sas.TimeFormat)),
 	}, nil)
 	if err != nil {
@@ -172,7 +168,6 @@ func (s *azureBLOBStorage) presignedUrlWithToken(ctx context.Context, storagePat
 
 	qp, err := sas.BlobSignatureValues{
 		Protocol:      sas.ProtocolHTTPS,
-		StartTime:     now,
 		ExpiryTime:    exp,
 		Permissions:   (&sas.BlobPermissions{Read: true}).String(),
 		ContainerName: s.conf.ContainerName,
@@ -197,7 +192,7 @@ func (s *azureBLOBStorage) PutObject(ctx context.Context, storagePath string, da
 		HTTPHeaders:      headers,
 		AccessConditions: conditions,
 	})
-	return wrapAzureObjectError(err)
+	return wrapAzureWriteError(err, opts.IfAbsent)
 }
 
 func azureWriteOptions(opts PutOptions) (*blob.HTTPHeaders, *blob.AccessConditions) {
@@ -228,11 +223,7 @@ func (s *azureBLOBStorage) UploadObject(ctx context.Context, storagePath string,
 		HTTPHeaders:      headers,
 		AccessConditions: conditions,
 	})
-	// A racing upload's commit discards this one's staged blocks.
-	if opts.IfAbsent && bloberror.HasCode(err, bloberror.InvalidBlockList) {
-		return fmt.Errorf("%w: %w", ErrExists, wrapAzureError(err))
-	}
-	return wrapAzureObjectError(err)
+	return wrapAzureWriteError(err, opts.IfAbsent)
 }
 
 func (s *azureBLOBStorage) GetObject(ctx context.Context, storagePath string) ([]byte, error) {
@@ -312,6 +303,7 @@ func (s *azureBLOBStorage) ListObjects(ctx context.Context, prefix string) ([]st
 			}
 		}
 	}
+	slices.Sort(keys)
 	return keys, nil
 }
 
@@ -360,8 +352,18 @@ func wrapAzureObjectError(err error) error {
 		return nil
 	case bloberror.HasCode(err, bloberror.BlobNotFound):
 		return fmt.Errorf("%w: %w", ErrNotFound, wrapAzureError(err))
-	case bloberror.HasCode(err, bloberror.BlobAlreadyExists, bloberror.ConditionNotMet):
-		return fmt.Errorf("%w: %w", ErrExists, wrapAzureError(err))
 	}
 	return wrapAzureError(err)
+}
+
+// wrapAzureWriteError is wrapAzureObjectError with a failed condition as
+// ErrExists where IfAbsent set one. A read can fail one too: the retry reader
+// pins its retries to the first response's ETag.
+func wrapAzureWriteError(err error, ifAbsent bool) error {
+	// InvalidBlockList is a racing upload whose commit discarded this one's
+	// staged blocks.
+	if ifAbsent && bloberror.HasCode(err, bloberror.BlobAlreadyExists, bloberror.ConditionNotMet, bloberror.InvalidBlockList) {
+		return fmt.Errorf("%w: %w", ErrExists, wrapAzureError(err))
+	}
+	return wrapAzureObjectError(err)
 }

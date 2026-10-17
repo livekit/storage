@@ -17,8 +17,10 @@ package storage
 import (
 	"context"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"testing"
 	"time"
 
@@ -28,8 +30,9 @@ import (
 // A connection is cut when no bytes move for idleTimeout, and never while a
 // slow transfer is still moving them.
 func TestIdleTimeout(t *testing.T) {
-	idleTimeout = 300 * time.Millisecond
-	t.Cleanup(func() { idleTimeout = 5 * time.Minute })
+	saved := idleTimeout
+	idleTimeout = time.Second
+	t.Cleanup(func() { idleTimeout = saved })
 	client := &http.Client{Transport: transportWithTimeouts(nil)}
 
 	t.Run("slow upload", func(t *testing.T) {
@@ -78,6 +81,22 @@ func TestIdleTimeout(t *testing.T) {
 	})
 }
 
+// A deadline set from above, as TLS sets one to send its close alert, holds:
+// reads and writes do not push it out to the idle timeout.
+func TestIdleConnKeepsDeadlines(t *testing.T) {
+	client, server := net.Pipe()
+	t.Cleanup(func() { client.Close(); server.Close() })
+	c := &idleConn{Conn: client, timeout: time.Hour}
+
+	require.NoError(t, c.SetDeadline(time.Now().Add(100*time.Millisecond)))
+	start := time.Now()
+	_, err := c.Write([]byte("x")) // nobody reads the other end
+	require.ErrorIs(t, err, os.ErrDeadlineExceeded)
+	_, err = c.Read(make([]byte, 1))
+	require.ErrorIs(t, err, os.ErrDeadlineExceeded)
+	require.Less(t, time.Since(start), 5*time.Second)
+}
+
 // stalled is a server that accepts requests and never answers them.
 func stalled(t *testing.T) string {
 	done := make(chan struct{})
@@ -88,7 +107,7 @@ func stalled(t *testing.T) string {
 	return srv.URL
 }
 
-// trickle yields n bytes, one every 100ms, a third of the idle timeout.
+// trickle yields n bytes, one every 100ms, a tenth of the idle timeout.
 type trickle struct {
 	n     int
 	flush http.Flusher

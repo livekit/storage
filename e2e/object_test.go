@@ -17,14 +17,18 @@ package e2e
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/iotest"
 	"time"
 
 	"github.com/stretchr/testify/require"
@@ -44,6 +48,9 @@ type objectsSuite struct {
 	multipartIfAbsentRaces bool
 	// multipartIgnoresIfAbsent: a multipart upload's commit ignores IfAbsent.
 	multipartIgnoresIfAbsent bool
+	// overwritesInPlace: a write replaces an object as it goes, so a failed
+	// one leaves none (local, as a filesystem).
+	overwritesInPlace bool
 	// commit tells the request that makes a multipart upload's object, and
 	// whether it carries IfAbsent's condition, which a store that ignores the
 	// condition cannot show.
@@ -105,8 +112,16 @@ func testObjectsWith(t *testing.T, s storage.Storage, suite objectsSuite) {
 		require.ErrorIs(t, err, storage.ErrNotFound)
 		_, err = s.GetObjectRange(ctx, missing, 0, 1)
 		require.ErrorIs(t, err, storage.ErrNotFound)
-		_, err = s.DownloadFile(ctx, filepath.Join(t.TempDir(), "missing"), missing)
+		_, err = s.DownloadObject(ctx, missing, io.Discard)
 		require.ErrorIs(t, err, storage.ErrNotFound)
+		// A failed download leaves the file it would have written as it was.
+		kept := filepath.Join(t.TempDir(), "kept")
+		require.NoError(t, os.WriteFile(kept, []byte("kept"), 0o600))
+		_, err = s.DownloadFile(ctx, missing, kept)
+		require.ErrorIs(t, err, storage.ErrNotFound)
+		got, err := os.ReadFile(kept)
+		require.NoError(t, err)
+		require.Equal(t, []byte("kept"), got)
 		exists, err := s.ObjectExists(ctx, missing)
 		require.NoError(t, err)
 		require.False(t, exists)
@@ -142,6 +157,35 @@ func testObjectsWith(t *testing.T, s storage.Storage, suite objectsSuite) {
 		for name, body := range sizes {
 			t.Run(name, func(t *testing.T) {
 				testIfAbsentRace(t, s, prefix+"race-"+name, body)
+			})
+		}
+	})
+
+	// An upload whose body fails partway stores nothing: a key it would create
+	// stays empty, and an object it would replace keeps its bytes.
+	t.Run("failed body", func(t *testing.T) {
+		for name, size := range map[string]int{"single part": 1 << 10, "multipart": 17 << 20} {
+			t.Run(name, func(t *testing.T) {
+				path := prefix + "failed-body/" + strings.ReplaceAll(name, " ", "-")
+				t.Cleanup(func() { _ = s.DeleteObjects(context.Background(), []string{path}) })
+				failing := func() io.Reader {
+					return io.MultiReader(bytes.NewReader(make([]byte, size)), iotest.ErrReader(errors.New("body failed")))
+				}
+
+				require.Error(t, s.UploadObject(ctx, path, failing(), storage.PutOptions{}))
+				exists, err := s.ObjectExists(ctx, path)
+				require.NoError(t, err)
+				require.False(t, exists, "a failed upload created the object")
+
+				require.NoError(t, s.PutObject(ctx, path, []byte("old"), storage.PutOptions{}))
+				require.Error(t, s.UploadObject(ctx, path, failing(), storage.PutOptions{}))
+				got, err := s.GetObject(ctx, path)
+				if suite.overwritesInPlace {
+					require.ErrorIs(t, err, storage.ErrNotFound)
+					return
+				}
+				require.NoError(t, err)
+				require.Equal(t, []byte("old"), got, "a failed upload replaced the object")
 			})
 		}
 	})
@@ -236,17 +280,22 @@ func testIfAbsentRace(t *testing.T, s storage.Storage, path string, body []byte)
 		r := &heldReader{r: bytes.NewReader(append([]byte{byte(i)}, body...)), arrived: &arrived, late: &late}
 		go func() { errs <- s.UploadObject(ctx, path, r, storage.PutOptions{IfAbsent: true}) }()
 	}
-	var won int
+	var won []byte
 	for range 2 {
 		err := <-errs
 		if err == nil {
-			won++
+			require.Nil(t, won, "both uploads won")
+			won = []byte{}
 			continue
 		}
 		require.ErrorIs(t, err, storage.ErrExists)
 	}
-	require.Equal(t, 1, won)
+	require.NotNil(t, won, "no upload won")
 	require.False(t, late.Load(), "the uploads never overlapped, so nothing raced")
+	// The object is one upload's whole body: the loser wrote nothing.
+	got, err := s.GetObject(ctx, path)
+	require.NoError(t, err)
+	require.Contains(t, [][]byte{append([]byte{0}, body...), append([]byte{1}, body...)}, got)
 }
 
 // heldReader holds its first read until every reader sharing arrived has

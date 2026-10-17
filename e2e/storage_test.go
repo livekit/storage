@@ -100,7 +100,7 @@ func TestLocal(t *testing.T) {
 	require.NoError(t, err)
 
 	testStorage(t, s)
-	testObjects(t, s)
+	testObjectsWith(t, s, objectsSuite{overwritesInPlace: true})
 }
 
 func TestOCI(t *testing.T) {
@@ -238,7 +238,7 @@ func testStorage(t *testing.T, s storage.Storage) {
 		require.NoError(t, err)
 		require.NoError(t, tmp.Close())
 
-		loc, size, err := s.UploadFile(context.Background(), tmp.Name(), pathFile, "text/plain")
+		loc, size, err := s.UploadFile(context.Background(), pathFile, tmp.Name(), storage.PutOptions{ContentType: "text/plain"})
 		require.NoError(t, err)
 		require.Equal(t, int64(len(filePayload)), size)
 		assertLocation(t, loc, pathFile)
@@ -265,7 +265,7 @@ func testStorage(t *testing.T, s storage.Storage) {
 		require.NoError(t, tmp.Close())
 		defer os.Remove(tmp.Name())
 
-		size, err := s.DownloadFile(context.Background(), tmp.Name(), pathFile)
+		size, err := s.DownloadFile(context.Background(), pathFile, tmp.Name())
 		require.NoError(t, err)
 		require.Equal(t, int64(len(filePayload)), size)
 
@@ -293,6 +293,7 @@ func testStorage(t *testing.T, s storage.Storage) {
 		require.NoError(t, err)
 		defer resp.Body.Close()
 		require.Equal(t, http.StatusOK, resp.StatusCode)
+		require.Equal(t, "text/plain", resp.Header.Get("Content-Type"), "the content type written")
 		body, err := io.ReadAll(resp.Body)
 		require.NoError(t, err)
 		require.Equal(t, dataPayload, body)
@@ -334,7 +335,7 @@ func testStorage(t *testing.T, s storage.Storage) {
 		file := filepath.Join(t.TempDir(), "multipart")
 		require.NoError(t, os.WriteFile(file, payload, 0o600))
 
-		loc, size, err := s.UploadFile(context.Background(), file, pathMultipart, "application/octet-stream")
+		loc, size, err := s.UploadFile(context.Background(), pathMultipart, file, storage.PutOptions{ContentType: "application/octet-stream"})
 		require.NoError(t, err)
 		require.Equal(t, int64(len(payload)), size)
 		assertLocation(t, loc, pathMultipart)

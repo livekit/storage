@@ -25,6 +25,7 @@ import (
 	"net/url"
 	"os"
 	"path"
+	"slices"
 	"strings"
 	"time"
 
@@ -60,7 +61,7 @@ func NewOCI(conf *OCIConfig) (Storage, error) {
 		client.Host = conf.Endpoint
 	}
 	// The SDK's 60s http.Client.Timeout covers reading the body and would cut a
-	// long transfer; a response header timeout catches a dead connection instead.
+	// long transfer; the idle timeout catches a dead connection instead.
 	// Its transport wrapper stays, as it loads OCI_DEFAULT_CERTS_PATH and
 	// refreshes the TLS config.
 	if hc, ok := client.HTTPClient.(*http.Client); ok {
@@ -99,14 +100,37 @@ func NewOCI(conf *OCIConfig) (Storage, error) {
 		if conf.CompartmentID != "" {
 			req.CompartmentId = &conf.CompartmentID
 		}
-		resp, err := client.GetNamespace(context.Background(), req)
-		if err != nil {
-			return nil, wrapOCIError(err)
+		if s.namespace, err = lookupNamespace(client, req); err != nil {
+			return nil, err
 		}
-		s.namespace = *resp.Value
 	}
 
 	return s, nil
+}
+
+// lookupNamespace is the tenancy's namespace, or an error after a minute, as
+// with the SDK's own client timeout. A canceled OCI call races in the SDK, so
+// the lookup is not canceled but left to finish.
+func lookupNamespace(client objectstorage.ObjectStorageClient, req objectstorage.GetNamespaceRequest) (string, error) {
+	type result struct {
+		namespace string
+		err       error
+	}
+	done := make(chan result, 1)
+	go func() {
+		resp, err := client.GetNamespace(context.Background(), req)
+		if err != nil {
+			done <- result{err: wrapOCIError(err)}
+			return
+		}
+		done <- result{namespace: *resp.Value}
+	}()
+	select {
+	case r := <-done:
+		return r.namespace, r.err
+	case <-time.After(time.Minute):
+		return "", errors.New("storage: OCI namespace lookup took over a minute")
+	}
 }
 
 func newConfigProvider(conf *OCIConfig) (common.ConfigurationProvider, error) {
@@ -136,7 +160,10 @@ func newConfigProvider(conf *OCIConfig) (common.ConfigurationProvider, error) {
 // can retry by seeking it: a multipart upload would need more permissions and
 // can leave uncommitted parts behind.
 
-func (s *ociStorage) UploadFile(ctx context.Context, filepath, storagePath, contentType string) (string, int64, error) {
+// UploadFile sends the file in one PutObject, up to OCI's 50 GiB, which the SDK
+// can retry by seeking it, as on main: a multipart upload, which OCI advises
+// past 100 MiB, needs more permissions and can leave uncommitted parts behind.
+func (s *ociStorage) UploadFile(ctx context.Context, storagePath, filepath string, opts PutOptions) (string, int64, error) {
 	file, err := os.Open(filepath)
 	if err != nil {
 		return "", 0, err
@@ -147,7 +174,7 @@ func (s *ociStorage) UploadFile(ctx context.Context, filepath, storagePath, cont
 	if err != nil {
 		return "", 0, err
 	}
-	if err = s.put(ctx, storagePath, file, stat.Size(), PutOptions{ContentType: contentType}); err != nil {
+	if err = s.put(ctx, storagePath, file, stat.Size(), opts); err != nil {
 		return "", 0, err
 	}
 	return s.location(storagePath), stat.Size(), nil
@@ -165,14 +192,10 @@ func (s *ociStorage) url(p string) string {
 	return (&url.URL{Scheme: scheme, Host: s.host, Path: p}).String()
 }
 
-func (s *ociStorage) DownloadFile(ctx context.Context, filepath, storagePath string) (int64, error) {
-	file, err := os.Create(filepath)
-	if err != nil {
-		return 0, err
-	}
-	defer file.Close()
-
-	return s.DownloadObject(ctx, storagePath, file)
+func (s *ociStorage) DownloadFile(ctx context.Context, storagePath, filepath string) (int64, error) {
+	return downloadFile(filepath, func(f *os.File) (int64, error) {
+		return s.DownloadObject(ctx, storagePath, f)
+	})
 }
 
 // PresignedURL creates a pre-authenticated request. Unlike an S3
@@ -288,13 +311,17 @@ func (s *ociStorage) UploadObject(ctx context.Context, storagePath string, body 
 		return wrapOCIObjectError(err)
 	}
 
+	// The abort runs on: it cannot be bounded by canceling it, which races in
+	// the SDK, and the caller's deadline may be what failed the upload.
 	if err = s.uploadParts(ctx, storagePath, created.UploadId, body, part, len(part), ifNoneMatch); err != nil {
-		_, _ = s.client.AbortMultipartUpload(context.WithoutCancel(ctx), objectstorage.AbortMultipartUploadRequest{
-			NamespaceName: &s.namespace,
-			BucketName:    &s.conf.Bucket,
-			ObjectName:    &storagePath,
-			UploadId:      created.UploadId,
-		})
+		go func() {
+			_, _ = s.client.AbortMultipartUpload(context.WithoutCancel(ctx), objectstorage.AbortMultipartUploadRequest{
+				NamespaceName: &s.namespace,
+				BucketName:    &s.conf.Bucket,
+				ObjectName:    &storagePath,
+				UploadId:      created.UploadId,
+			})
+		}()
 	}
 	return err
 }
@@ -419,6 +446,7 @@ func (s *ociStorage) ListObjects(ctx context.Context, prefix string) ([]string, 
 			keys = append(keys, *obj.Name)
 		}
 		if resp.NextStartWith == nil {
+			slices.Sort(keys)
 			return keys, nil
 		}
 		start = resp.NextStartWith

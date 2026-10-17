@@ -21,12 +21,10 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
-	"math/rand/v2"
 	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
-	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -58,40 +56,24 @@ func (u *localUploader) file(storagePath string) (string, error) {
 	return p, nil
 }
 
-func (u *localUploader) UploadFile(ctx context.Context, localPath, storagePath, _ string) (string, int64, error) {
+func (u *localUploader) UploadFile(ctx context.Context, storagePath, localPath string, opts PutOptions) (string, int64, error) {
 	file, err := os.Open(localPath)
 	if err != nil {
 		return "", 0, err
 	}
 	defer file.Close()
-
-	dst, n, err := u.upload(ctx, storagePath, file, PutOptions{})
-	return dst, n, err
+	return u.upload(ctx, storagePath, file, opts)
 }
 
-func (u *localUploader) DownloadFile(ctx context.Context, localPath, storagePath string) (int64, error) {
-	src, err := u.file(storagePath)
+func (u *localUploader) DownloadFile(_ context.Context, storagePath, localPath string) (int64, error) {
+	f, err := u.open(storagePath)
 	if err != nil {
 		return 0, err
-	}
-	f, err := os.Open(src)
-	if err != nil {
-		return 0, localObjectError(err)
 	}
 	defer f.Close()
-
-	if dir := filepath.Dir(localPath); dir != "." {
-		if err = os.MkdirAll(dir, 0755); err != nil {
-			return 0, err
-		}
-	}
-	local, err := os.Create(localPath)
-	if err != nil {
-		return 0, err
-	}
-	defer local.Close()
-
-	return io.Copy(local, f)
+	return downloadFile(localPath, func(local *os.File) (int64, error) {
+		return io.Copy(local, f)
+	})
 }
 
 const localUploadPrefix = ".upload-"
@@ -106,9 +88,12 @@ func (u *localUploader) UploadObject(ctx context.Context, storagePath string, bo
 	return err
 }
 
-// upload writes a temporary file, syncs it and links or renames it into place,
-// so readers never see a partial object, a crash leaves none, and IfAbsent is
-// atomic. It returns the object's path and the bytes written.
+// upload writes the object in place, as on main: a mounted volume (gcsfuse,
+// s3fs) sends a rename to its store as a copy, and a consumer watching for the
+// file to be closed sees it. A reader can see the object while it is written,
+// and a failed write removes it. IfAbsent writes a temporary file and links it
+// into place, which is atomic. It returns the object's path and the bytes
+// written, synced.
 func (u *localUploader) upload(ctx context.Context, storagePath string, body io.Reader, opts PutOptions) (string, int64, error) {
 	dst, err := u.file(storagePath)
 	if err != nil {
@@ -117,59 +102,62 @@ func (u *localUploader) upload(ctx context.Context, storagePath string, body io.
 	if err = ctx.Err(); err != nil {
 		return "", 0, err
 	}
-	tmp, err := createUploadFile(filepath.Dir(dst))
+	if opts.IfAbsent {
+		return uploadIfAbsent(dst, body)
+	}
+
+	f, err := createFile(dst, os.O_TRUNC)
 	if err != nil {
 		return "", 0, err
 	}
-	defer os.Remove(tmp.Name())
-
-	n, err := io.Copy(tmp, body)
-	if err == nil {
-		err = tmp.Sync()
-	}
-	if closeErr := tmp.Close(); err == nil {
-		err = closeErr
-	}
+	n, err := writeFile(f, body)
 	if err != nil {
-		return "", 0, err
-	}
-
-	if !opts.IfAbsent {
-		err = os.Rename(tmp.Name(), dst)
-	} else if err = os.Link(tmp.Name(), dst); errors.Is(err, fs.ErrExist) {
-		err = ErrExists
-	}
-	if err != nil {
+		_ = os.Remove(dst)
 		return "", 0, err
 	}
 	return dst, n, nil
 }
 
-// createUploadFile is a new file in dir, made with its parents, with the mode
-// os.Create gives, 0666 less the umask, which moving it into place keeps:
-// os.CreateTemp's 0600 would hide objects from other users, such as a host
-// reading a container's volume. A delete can remove dir once empty, before
-// the file is in it, so it is made again.
-func createUploadFile(dir string) (*os.File, error) {
-	for {
-		if err := os.MkdirAll(dir, 0755); err != nil {
-			return nil, err
-		}
-		name := filepath.Join(dir, localUploadPrefix+strconv.FormatUint(rand.Uint64(), 36))
-		f, err := os.OpenFile(name, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o666)
-		if !errors.Is(err, fs.ErrExist) && !errors.Is(err, fs.ErrNotExist) {
-			return f, err
-		}
+func uploadIfAbsent(dst string, body io.Reader) (string, int64, error) {
+	tmp, err := createTemp(filepath.Dir(dst), localUploadPrefix)
+	if err != nil {
+		return "", 0, err
+	}
+	defer os.Remove(tmp.Name())
+
+	n, err := writeFile(tmp, body)
+	if err != nil {
+		return "", 0, err
+	}
+	// A hard link fails where it already exists, and on filesystems without
+	// hard links, such as SMB and most FUSE mounts.
+	if err = os.Link(tmp.Name(), dst); errors.Is(err, fs.ErrExist) {
+		return "", 0, ErrExists
+	}
+	if err != nil {
+		return "", 0, err
+	}
+	syncDir(filepath.Dir(dst))
+	return dst, n, nil
+}
+
+// syncDir persists the names in dir, so an object linked into it survives a
+// crash. It is best effort: some filesystems, such as FUSE mounts, refuse to
+// sync a directory, and the object's bytes are synced already.
+func syncDir(dir string) {
+	if d, err := os.Open(dir); err == nil {
+		_ = d.Sync()
+		_ = d.Close()
 	}
 }
 
 func (u *localUploader) GetObject(_ context.Context, storagePath string) ([]byte, error) {
-	src, err := u.file(storagePath)
+	f, err := u.open(storagePath)
 	if err != nil {
 		return nil, err
 	}
-	data, err := os.ReadFile(src)
-	return data, localObjectError(err)
+	defer f.Close()
+	return io.ReadAll(f)
 }
 
 func (u *localUploader) GetObjectRange(_ context.Context, storagePath string, offset, length int64) ([]byte, error) {
@@ -203,13 +191,25 @@ func (u *localUploader) DownloadObject(_ context.Context, storagePath string, w 
 	return io.Copy(w, f)
 }
 
+// open is the object's file. A directory is no object, as a prefix is not on
+// a store.
 func (u *localUploader) open(storagePath string) (*os.File, error) {
 	src, err := u.file(storagePath)
 	if err != nil {
 		return nil, err
 	}
 	f, err := os.Open(src)
-	return f, localObjectError(err)
+	if err != nil {
+		return nil, localObjectError(err)
+	}
+	if info, err := f.Stat(); err != nil || info.IsDir() {
+		f.Close()
+		if err == nil {
+			err = syscall.EISDIR
+		}
+		return nil, localObjectError(err)
+	}
+	return f, nil
 }
 
 // ObjectExists reports a directory as no object, as a store reports a prefix.
@@ -241,19 +241,31 @@ func (u *localUploader) ListObjects(_ context.Context, prefix string) ([]string,
 	}
 
 	// The trailing separator has the walk follow a root that is a symlink.
+	walkRoot := root + string(filepath.Separator)
 	var keys []string
-	err := filepath.WalkDir(root+string(filepath.Separator), func(p string, d fs.DirEntry, err error) error {
+	err := filepath.WalkDir(walkRoot, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
+			// A directory a delete removes mid-walk held no more keys; only a
+			// missing root means the prefix holds none.
+			if p != walkRoot && errors.Is(localObjectError(err), ErrNotFound) {
+				return nil
+			}
 			return err
-		}
-		if d.IsDir() || strings.HasPrefix(d.Name(), localUploadPrefix) {
-			return nil
 		}
 		rel, err := filepath.Rel(u.StorageDir, p)
 		if err != nil {
 			return err
 		}
-		if key := filepath.ToSlash(rel); strings.HasPrefix(key, prefix) {
+		key := filepath.ToSlash(rel)
+		if d.IsDir() {
+			// A directory none of whose keys can start with the prefix is not
+			// walked, so a listing reads only what it may return.
+			if p != walkRoot && !strings.HasPrefix(key+"/", prefix) && !strings.HasPrefix(prefix, key+"/") {
+				return fs.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasPrefix(d.Name(), localUploadPrefix) && strings.HasPrefix(key, prefix) {
 			keys = append(keys, key)
 		}
 		return nil

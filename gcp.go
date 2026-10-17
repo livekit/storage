@@ -23,17 +23,19 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"slices"
 	"strings"
-	"sync"
 	"time"
 
 	"cloud.google.com/go/storage"
 	"github.com/googleapis/gax-go/v2"
+	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
 	"golang.org/x/oauth2/jwt"
 	"google.golang.org/api/googleapi"
 	"google.golang.org/api/iterator"
 	"google.golang.org/api/option"
+	htransport "google.golang.org/api/transport/http"
 )
 
 const storageScope = "https://www.googleapis.com/auth/devstorage.read_write"
@@ -75,6 +77,13 @@ func NewGCP(conf *GCPConfig) (Storage, error) {
 	// An http:// endpoint is an emulator, which takes no credentials; any other
 	// endpoint, such as Private Service Connect, keeps them.
 	emulator := strings.HasPrefix(conf.Endpoint, "http://")
+	setProxy, err := proxySetter(conf.ProxyConfig)
+	if err != nil {
+		return nil, err
+	}
+	t := transportWithTimeouts(http.DefaultTransport)
+	setProxy(t)
+
 	var opts []option.ClientOption
 	if conf.CredentialsJSON != "" {
 		jwtConfig, err := google.JWTConfigFromJSON([]byte(conf.CredentialsJSON), storageScope)
@@ -83,7 +92,10 @@ func NewGCP(conf *GCPConfig) (Storage, error) {
 		}
 		u.signer = jwtConfig
 		if !emulator {
-			opts = append(opts, option.WithTokenSource(jwtConfig.TokenSource(context.Background())))
+			// Tokens are fetched through the same transport, so with the proxy
+			// and timeouts, not through http.DefaultClient.
+			tokens := &http.Client{Transport: t, Timeout: time.Minute}
+			opts = append(opts, option.WithTokenSource(jwtConfig.TokenSource(context.WithValue(context.Background(), oauth2.HTTPClient, tokens))))
 		}
 	}
 	if conf.Endpoint != "" {
@@ -93,11 +105,7 @@ func NewGCP(conf *GCPConfig) (Storage, error) {
 		opts = append(opts, option.WithoutAuthentication())
 	}
 
-	setProxy, err := proxySetter(conf.ProxyConfig)
-	if err != nil {
-		return nil, err
-	}
-	client, err := newGCSClient(opts, setProxy)
+	client, err := newGCSClient(opts, t)
 	if err != nil {
 		return nil, err
 	}
@@ -106,7 +114,7 @@ func NewGCP(conf *GCPConfig) (Storage, error) {
 	return u, nil
 }
 
-func (s *gcpStorage) UploadFile(ctx context.Context, filepath, storagePath, contentType string) (string, int64, error) {
+func (s *gcpStorage) UploadFile(ctx context.Context, storagePath, filepath string, opts PutOptions) (string, int64, error) {
 	file, err := os.Open(filepath)
 	if err != nil {
 		return "", 0, err
@@ -117,20 +125,16 @@ func (s *gcpStorage) UploadFile(ctx context.Context, filepath, storagePath, cont
 	if err != nil {
 		return "", 0, err
 	}
-	if err = s.UploadObject(ctx, storagePath, file, PutOptions{ContentType: contentType}); err != nil {
+	if err = s.UploadObject(ctx, storagePath, file, opts); err != nil {
 		return "", 0, err
 	}
 	return s.location(storagePath), stat.Size(), nil
 }
 
-func (s *gcpStorage) DownloadFile(ctx context.Context, filepath, storagePath string) (int64, error) {
-	file, err := os.Create(filepath)
-	if err != nil {
-		return 0, err
-	}
-	defer file.Close()
-
-	return s.DownloadObject(ctx, storagePath, file)
+func (s *gcpStorage) DownloadFile(ctx context.Context, storagePath, filepath string) (int64, error) {
+	return downloadFile(filepath, func(f *os.File) (int64, error) {
+		return s.DownloadObject(ctx, storagePath, f)
+	})
 }
 
 func (s *gcpStorage) location(storagePath string) string {
@@ -147,16 +151,22 @@ func (s *gcpStorage) presignedURL(storagePath string, expiration time.Duration) 
 		Expires: time.Now().Add(expiration),
 	}
 	// A V2 URL, which has no limit on its expiry, is always https; an http://
-	// emulator takes V4, which signs for at most 7 days.
+	// emulator takes V4, which signs for at most 7 days. A private endpoint,
+	// such as Private Service Connect, is not where the URL's reader is, so it
+	// names the public host, as location does.
 	if strings.HasPrefix(s.conf.Endpoint, "http://") {
 		opts.Scheme = storage.SigningSchemeV4
 		opts.Insecure = true
+	} else if s.conf.Endpoint != "" {
+		opts.Hostname = "storage.googleapis.com"
 	}
 	if s.signer != nil {
 		opts.GoogleAccessID = s.signer.Email
 		opts.PrivateKey = s.signer.PrivateKey
 	}
-	u, err := s.client.Bucket(s.conf.Bucket).SignedURL(storagePath, opts)
+	// Without a key of its own, signing calls IAM, which the SDK otherwise
+	// retries until the call's context ends, and SignedURL takes none.
+	u, err := s.client.Bucket(s.conf.Bucket).Retryer(storage.WithMaxAttempts(5)).SignedURL(storagePath, opts)
 	if err != nil {
 		return "", wrapGCPError(err)
 	}
@@ -179,17 +189,22 @@ func (s *gcpStorage) UploadObject(ctx context.Context, storagePath string, body 
 	return s.write(ctx, storagePath, body, opts, googleapi.DefaultUploadChunkSize)
 }
 
+// gcsRetryAlways retries a call the SDK would not, as it is not idempotent
+// on its own: an overwrite, or a delete, where a missing object counts as
+// deleted.
+var gcsRetryAlways = []storage.RetryOption{
+	storage.WithBackoff(gax.Backoff{Initial: 100 * time.Millisecond, Max: 5 * time.Second, Multiplier: 2}),
+	storage.WithMaxAttempts(5),
+	storage.WithPolicy(storage.RetryAlways),
+}
+
 func (s *gcpStorage) write(ctx context.Context, storagePath string, body io.Reader, opts PutOptions, chunkSize int) error {
 	obj := s.object(storagePath)
 	if opts.IfAbsent {
 		// Conditional, so the SDK retries it by default.
 		obj = obj.If(storage.Conditions{DoesNotExist: true})
 	} else {
-		obj = obj.Retryer(
-			storage.WithBackoff(gax.Backoff{Initial: 100 * time.Millisecond, Max: 5 * time.Second, Multiplier: 2}),
-			storage.WithMaxAttempts(5),
-			storage.WithPolicy(storage.RetryAlways),
-		)
+		obj = obj.Retryer(gcsRetryAlways...)
 	}
 
 	ctx, cancel := context.WithCancel(ctx)
@@ -197,6 +212,9 @@ func (s *gcpStorage) write(ctx context.Context, storagePath string, body io.Read
 	w := obj.NewWriter(ctx)
 	w.ContentType = opts.ContentType
 	w.ChunkSize = chunkSize
+	// The SDK gives up retrying a chunk after 32s, which a 16 MiB chunk on a
+	// slow link takes to send; past the idle timeout, a stalled one is retried.
+	w.ChunkRetryDeadline = 2 * idleTimeout
 	if _, err := io.Copy(w, body); err != nil {
 		// Cancelling aborts the upload; Close would store what was sent.
 		cancel()
@@ -255,11 +273,16 @@ func (s *gcpStorage) ObjectExists(ctx context.Context, storagePath string) (bool
 }
 
 func (s *gcpStorage) ListObjects(ctx context.Context, prefix string) ([]string, error) {
-	it := s.client.Bucket(s.conf.Bucket).Objects(ctx, &storage.Query{Prefix: prefix})
+	q := &storage.Query{Prefix: prefix}
+	if err := q.SetAttrSelection([]string{"Name"}); err != nil {
+		return nil, err
+	}
+	it := s.client.Bucket(s.conf.Bucket).Objects(ctx, q)
 	var keys []string
 	for {
 		attrs, err := it.Next()
 		if errors.Is(err, iterator.Done) {
+			slices.Sort(keys)
 			return keys, nil
 		}
 		if err != nil {
@@ -271,7 +294,7 @@ func (s *gcpStorage) ListObjects(ctx context.Context, prefix string) ([]string, 
 
 func (s *gcpStorage) DeleteObjects(ctx context.Context, storagePaths []string) error {
 	return deleteEach(ctx, storagePaths, func(ctx context.Context, p string) error {
-		if err := s.object(p).Delete(ctx); err != nil && !errors.Is(err, storage.ErrObjectNotExist) {
+		if err := s.object(p).Retryer(gcsRetryAlways...).Delete(ctx); err != nil && !errors.Is(err, storage.ErrObjectNotExist) {
 			return wrapGCPObjectError(err)
 		}
 		return nil
@@ -293,19 +316,19 @@ func wrapGCPObjectError(err error) error {
 }
 
 // gcsTransportMu serializes newGCSClient's swap of http.DefaultTransport.
-var gcsTransportMu sync.Mutex
-
-// newGCSClient builds a client on a transport with this package's timeouts and
-// the proxy. The SDK copies http.DefaultTransport when it builds a client, and
-// passing a client of our own would mean wiring its auth by hand, so the
-// transport stands in as the default only while the client is built.
-func newGCSClient(opts []option.ClientOption, setProxy func(*http.Transport)) (*storage.Client, error) {
-	gcsTransportMu.Lock()
-	defer gcsTransportMu.Unlock()
-	orig := http.DefaultTransport
-	t := transportWithTimeouts(orig)
-	setProxy(t)
-	http.DefaultTransport = t
-	defer func() { http.DefaultTransport = orig }()
-	return storage.NewClient(context.Background(), opts...)
+// newGCSClient builds a client that sends through t, with the SDK's auth
+// added on top. The SDK chooses a client certificate and the mTLS endpoint only
+// on a transport of its own, so where GOOGLE_API_USE_CLIENT_CERTIFICATE asks
+// for them, the client keeps the SDK's, without this package's timeouts and
+// proxy.
+func newGCSClient(opts []option.ClientOption, t *http.Transport) (*storage.Client, error) {
+	ctx := context.Background()
+	if os.Getenv("GOOGLE_API_USE_CLIENT_CERTIFICATE") == "true" {
+		return storage.NewClient(ctx, opts...)
+	}
+	authed, err := htransport.NewTransport(ctx, t, append(opts, option.WithScopes(storage.ScopeFullControl, "https://www.googleapis.com/auth/cloud-platform"))...)
+	if err != nil {
+		return nil, err
+	}
+	return storage.NewClient(ctx, append(opts, option.WithHTTPClient(&http.Client{Transport: authed}))...)
 }

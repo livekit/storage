@@ -1,14 +1,21 @@
 # Storage
 
-A GORM-style storage wrapper with unified API for different cloud storage backends
+Object storage on S3 and S3-compatible stores, GCS, Azure Blob, OCI Object Storage, AliOSS and a local directory, behind one interface. `storage.New(conf)` returns a `Storage`; every call takes a context.
 
-`storage.New(conf)` returns a `Storage` for S3 and S3-compatible stores, GCS, Azure, OCI, AliOSS or a local directory. Every call takes a context.
-
-- `Bucket` (`storage/objects`): `PutObject`, `UploadObject` (can refuse to replace an object, `PutOptions.IfAbsent`), `GetObject`, `GetObjectRange`, `DownloadObject` (to any `io.Writer`), `ObjectExists`, `ListObjects`, `DeleteObjects`, `PresignedURL`. A missing object is `ErrNotFound` and a refused write `ErrExists` (`errors.Is`).
-- `Storage` is `Bucket` plus `UploadFile` and `DownloadFile`, which publish and fetch whole files.
-- Every backend follows S3's semantics where providers differ. `DeleteObjects` of a missing path succeeds, as S3's delete does, and fails while any path it was given still holds an object, so a retry after a partial failure is safe.
+- `Bucket` (`storage/objects`): `PutObject`, `UploadObject` (streams), `GetObject`, `GetObjectRange`, `DownloadObject` (to any `io.Writer`), `ObjectExists`, `ListObjects` (byte order), `DeleteObjects`, `PresignedURL`.
+- `Storage` is `Bucket` plus `UploadFile` and `DownloadFile`. `DownloadFile` replaces the local file only once the whole object is read.
+- `PutOptions{ContentType, IfAbsent}` on every write. `IfAbsent` refuses to replace an object, atomically where the store honors the condition.
+- Errors: a missing object is `ErrNotFound`, a write `IfAbsent` refuses is `ErrExists` (`errors.Is`); `ErrorWithStatusCode` carries the store's HTTP status (`errors.As`).
 - `storage/objects` imports no provider SDK, so a fake or a library can implement or accept the interfaces without pulling in every SDK.
-- The clients this package builds cut a connection that moves no bytes for 5 minutes, never a slow but live transfer; the context bounds the call.
+
+## Behavior
+
+- **S3 semantics** where stores differ. `DeleteObjects` of a missing path succeeds, as S3's delete does, and fails while any path it was given still holds an object, so a retry after a partial failure is safe.
+- **Keys** are the store's keys as given. The local directory, as a filesystem, drops a leading `/`, cleans `//` and `.`, refuses keys outside it, and cannot hold both `a` and `a/b`.
+- **Timeouts**: a connection that moves no bytes either way for 5 minutes is cut; a slow but live transfer never is. The context bounds the call.
+- **Retries**: every store retries throttling, 5xx and network errors with backoff, including AliOSS, whose SDK does not. A stream given to `UploadObject` is sent once on AliOSS.
+- **Proxy**: `ProxyConfig` (S3, GCS) carries its credentials for http and https targets, honors `NO_PROXY`, and never proxies the cloud metadata services.
+- **Local writes** go in place, as a file is written, so mounted volumes and file watchers see one write; `IfAbsent` writes a temporary file (`.upload-*`, never listed) and links it into place.
 
 ## Tests
 

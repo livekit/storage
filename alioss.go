@@ -20,10 +20,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"slices"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/aliyun/aliyun-oss-go-sdk/oss"
@@ -72,13 +76,15 @@ func NewAliOSS(conf *AliOSSConfig) (Storage, error) {
 	}, nil
 }
 
-func (s *aliOSSStorage) UploadFile(ctx context.Context, filepath, storagePath, contentType string) (string, int64, error) {
+func (s *aliOSSStorage) UploadFile(ctx context.Context, storagePath, filepath string, opts PutOptions) (string, int64, error) {
 	info, err := os.Stat(filepath)
 	if err != nil {
 		return "", 0, err
 	}
-	if err = s.bucket.PutObjectFromFile(storagePath, filepath, oss.ContentType(contentType), oss.WithContext(ctx)); err != nil {
-		return "", 0, wrapAliOSSError(err)
+	if err = aliOSSRetry(ctx, func() error {
+		return s.bucket.PutObjectFromFile(storagePath, filepath, aliOSSWriteOptions(ctx, opts)...)
+	}); err != nil {
+		return "", 0, wrapAliOSSObjectError(err)
 	}
 	return s.location(storagePath), info.Size(), nil
 }
@@ -90,8 +96,12 @@ func (s *aliOSSStorage) location(storagePath string) string {
 	return u.String()
 }
 
-func (s *aliOSSStorage) DownloadFile(ctx context.Context, filepath, storagePath string) (int64, error) {
-	if err := s.bucket.GetObjectToFile(storagePath, filepath, oss.WithContext(ctx)); err != nil {
+// DownloadFile has the SDK write a temporary file and rename it, as
+// downloadFile does for the other stores.
+func (s *aliOSSStorage) DownloadFile(ctx context.Context, storagePath, filepath string) (int64, error) {
+	if err := aliOSSRetry(ctx, func() error {
+		return s.bucket.GetObjectToFile(storagePath, filepath, oss.WithContext(ctx))
+	}); err != nil {
 		return 0, wrapAliOSSObjectError(err)
 	}
 	info, err := os.Stat(filepath)
@@ -110,14 +120,23 @@ func (s *aliOSSStorage) presignedURL(storagePath string, expiration time.Duratio
 }
 
 func (s *aliOSSStorage) PutObject(ctx context.Context, storagePath string, data []byte, opts PutOptions) error {
-	return s.UploadObject(ctx, storagePath, bytes.NewReader(data), opts)
+	return aliOSSRetry(ctx, func() error {
+		return s.UploadObject(ctx, storagePath, bytes.NewReader(data), opts)
+	})
 }
 
 // UploadObject streams body in one PutObject, chunked when its length is
-// unknown, so it holds no part in memory and caps an object at 5 GB. IfAbsent
-// sets x-oss-forbid-overwrite, atomic here, but OSS ignores it on a bucket with
+// unknown, so it holds no part in memory and caps an object at 5 GB. It is
+// sent once, as the body is read as it goes. IfAbsent sets
+// x-oss-forbid-overwrite, atomic here, but OSS ignores it on a bucket with
 // versioning enabled or suspended.
 func (s *aliOSSStorage) UploadObject(ctx context.Context, storagePath string, body io.Reader, opts PutOptions) error {
+	return wrapAliOSSObjectError(s.bucket.PutObject(storagePath, body, aliOSSWriteOptions(ctx, opts)...))
+}
+
+// aliOSSWriteOptions leaves out an empty content type, which the SDK then
+// takes from the key's extension.
+func aliOSSWriteOptions(ctx context.Context, opts PutOptions) []oss.Option {
 	options := []oss.Option{oss.WithContext(ctx)}
 	if opts.ContentType != "" {
 		options = append(options, oss.ContentType(opts.ContentType))
@@ -125,7 +144,7 @@ func (s *aliOSSStorage) UploadObject(ctx context.Context, storagePath string, bo
 	if opts.IfAbsent {
 		options = append(options, oss.ForbidOverWrite(true))
 	}
-	return wrapAliOSSObjectError(s.bucket.PutObject(storagePath, body, options...))
+	return options
 }
 
 func (s *aliOSSStorage) GetObject(ctx context.Context, storagePath string) ([]byte, error) {
@@ -156,7 +175,11 @@ func (s *aliOSSStorage) DownloadObject(ctx context.Context, storagePath string, 
 }
 
 func (s *aliOSSStorage) download(ctx context.Context, storagePath string, w io.Writer, options ...oss.Option) (int64, error) {
-	r, err := s.bucket.GetObject(storagePath, append(options, oss.WithContext(ctx))...)
+	var r io.ReadCloser
+	err := aliOSSRetry(ctx, func() (err error) {
+		r, err = s.bucket.GetObject(storagePath, append(options, oss.WithContext(ctx))...)
+		return err
+	})
 	if err != nil {
 		return 0, wrapAliOSSObjectError(err)
 	}
@@ -166,7 +189,11 @@ func (s *aliOSSStorage) download(ctx context.Context, storagePath string, w io.W
 }
 
 func (s *aliOSSStorage) ObjectExists(ctx context.Context, storagePath string) (bool, error) {
-	exists, err := s.bucket.IsObjectExist(storagePath, oss.WithContext(ctx))
+	var exists bool
+	err := aliOSSRetry(ctx, func() (err error) {
+		exists, err = s.bucket.IsObjectExist(storagePath, oss.WithContext(ctx))
+		return err
+	})
 	return exists, wrapAliOSSObjectError(err)
 }
 
@@ -174,7 +201,11 @@ func (s *aliOSSStorage) ListObjects(ctx context.Context, prefix string) ([]strin
 	var keys []string
 	options := []oss.Option{oss.Prefix(prefix), oss.MaxKeys(1000), oss.WithContext(ctx)}
 	for {
-		res, err := s.bucket.ListObjectsV2(options...)
+		var res oss.ListObjectsResultV2
+		err := aliOSSRetry(ctx, func() (err error) {
+			res, err = s.bucket.ListObjectsV2(options...)
+			return err
+		})
 		if err != nil {
 			return nil, wrapAliOSSObjectError(err)
 		}
@@ -182,6 +213,7 @@ func (s *aliOSSStorage) ListObjects(ctx context.Context, prefix string) ([]strin
 			keys = append(keys, obj.Key)
 		}
 		if !res.IsTruncated || res.NextContinuationToken == "" {
+			slices.Sort(keys)
 			return keys, nil
 		}
 		options = []oss.Option{oss.Prefix(prefix), oss.MaxKeys(1000), oss.ContinuationToken(res.NextContinuationToken), oss.WithContext(ctx)}
@@ -194,7 +226,11 @@ func (s *aliOSSStorage) ListObjects(ctx context.Context, prefix string) ([]strin
 func (s *aliOSSStorage) DeleteObjects(ctx context.Context, storagePaths []string) error {
 	for i := 0; i < len(storagePaths); i += 1000 {
 		batch := storagePaths[i:min(i+1000, len(storagePaths))]
-		res, err := s.bucket.DeleteObjects(batch, oss.WithContext(ctx))
+		var res oss.DeleteObjectsResult
+		err := aliOSSRetry(ctx, func() (err error) {
+			res, err = s.bucket.DeleteObjects(batch, oss.WithContext(ctx))
+			return err
+		})
 		if err != nil {
 			return wrapAliOSSObjectError(err)
 		}
@@ -220,6 +256,37 @@ func (s *aliOSSStorage) DeleteObjects(ctx context.Context, storagePaths []string
 
 func (s *aliOSSStorage) PresignedURL(_ context.Context, storagePath string, expiration time.Duration) (string, error) {
 	return s.presignedURL(storagePath, expiration)
+}
+
+// aliOSSAttempts is how many times a call is sent: the v1 SDK never retries.
+const aliOSSAttempts = 3
+
+// aliOSSRetry runs call again after a 5xx, a 429 or a network error, with
+// backoff, until it succeeds or aliOSSAttempts is spent. Only calls whose body,
+// if any, is sent anew each time are retried.
+func aliOSSRetry(ctx context.Context, call func() error) error {
+	var err error
+	for attempt := range aliOSSAttempts {
+		if err = call(); err == nil || ctx.Err() != nil || !aliOSSRetryable(err) {
+			return err
+		}
+		backoff := 200 * time.Millisecond << attempt
+		select {
+		case <-ctx.Done():
+			return err
+		case <-time.After(backoff/2 + rand.N(backoff)):
+		}
+	}
+	return err
+}
+
+func aliOSSRetryable(err error) bool {
+	var svcErr oss.ServiceError
+	if errors.As(err, &svcErr) {
+		return svcErr.StatusCode >= 500 || svcErr.StatusCode == http.StatusTooManyRequests
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, syscall.ECONNRESET)
 }
 
 func wrapAliOSSObjectError(err error) error {

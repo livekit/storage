@@ -15,6 +15,7 @@
 package storage_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -25,6 +26,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
+	"io"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
@@ -65,6 +67,19 @@ func TestS3CustomCABundle(t *testing.T) {
 func TestGCPLeavesDefaultTransport(t *testing.T) {
 	orig := http.DefaultTransport
 	before := orig.(*http.Transport).Clone()
+	// The rest of the process reads it meanwhile: under -race, a write races.
+	done := make(chan struct{})
+	t.Cleanup(func() { close(done) })
+	go func() {
+		for {
+			select {
+			case <-done:
+				return
+			default:
+				_ = http.DefaultTransport
+			}
+		}
+	}()
 
 	_, err := storage.New(&storage.GCPConfig{
 		Bucket:      "bucket",
@@ -100,23 +115,39 @@ func TestProxyCarriesRequests(t *testing.T) {
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
-			proxied := make(chan string, 16)
+			proxied := make(chan *http.Request, 16)
 			proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				proxied <- r.Host
+				proxied <- r
 				http.Error(w, "no", http.StatusForbidden)
 			}))
 			t.Cleanup(proxy.Close)
-			s, err := storage.New(conf(&storage.ProxyConfig{URL: proxy.URL}))
-			require.NoError(t, err)
+			send := func() {
+				s, err := storage.New(conf(&storage.ProxyConfig{URL: proxy.URL, Username: "user", Password: "pass"}))
+				require.NoError(t, err)
+				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+				defer cancel()
+				_, _ = s.ObjectExists(ctx, "path")
+			}
 
-			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-			defer cancel()
-			_, _ = s.ObjectExists(ctx, "path")
+			// The credentials reach the proxy for a plain http target too, not
+			// only on CONNECT.
+			send()
 			select {
-			case host := <-proxied:
-				require.Equal(t, "store.invalid", host)
+			case r := <-proxied:
+				require.Equal(t, "store.invalid", r.Host)
+				require.Equal(t, "Basic dXNlcjpwYXNz", r.Header.Get("Proxy-Authorization"))
 			default:
 				t.Fatal("the request went around the proxy")
+			}
+
+			// NO_PROXY is honored, as it is for the metadata services that hand
+			// out instance credentials.
+			t.Setenv("NO_PROXY", "store.invalid")
+			send()
+			select {
+			case <-proxied:
+				t.Fatal("a NO_PROXY host went through the proxy")
+			default:
 			}
 		})
 	}
@@ -165,7 +196,7 @@ func TestLocalFileMode(t *testing.T) {
 	require.NoError(t, s.PutObject(ctx, "put", []byte("x"), storage.PutOptions{IfAbsent: true}))
 	file := filepath.Join(t.TempDir(), "file")
 	require.NoError(t, os.WriteFile(file, []byte("x"), 0o600))
-	_, _, err = s.UploadFile(ctx, file, "file", "text/plain")
+	_, _, err = s.UploadFile(ctx, "file", file, storage.PutOptions{ContentType: "text/plain"})
 	require.NoError(t, err)
 	for _, name := range []string{"put", "file"} {
 		info, err := os.Stat(filepath.Join(dir, name))
@@ -231,6 +262,39 @@ func TestLocalKeys(t *testing.T) {
 	}
 }
 
+// A delete that removes an empty directory while a listing walks it does not
+// hide the other keys: an empty listing reads as no objects.
+func TestLocalListingDuringDeletes(t *testing.T) {
+	dir := t.TempDir()
+	s, err := storage.New(&storage.LocalConfig{StorageDir: dir})
+	require.NoError(t, err)
+	ctx := context.Background()
+	require.NoError(t, s.PutObject(ctx, "keep", []byte("x"), storage.PutOptions{}))
+
+	done := make(chan struct{})
+	churned := make(chan struct{})
+	go func() {
+		defer close(churned)
+		for {
+			select {
+			case <-done:
+				return
+			default:
+			}
+			// What a delete's cleanup of emptied directories does.
+			_ = os.MkdirAll(filepath.Join(dir, "d", "e"), 0o755)
+			_ = os.RemoveAll(filepath.Join(dir, "d"))
+		}
+	}()
+	for range 5000 {
+		keys, err := s.ListObjects(ctx, "")
+		require.NoError(t, err)
+		require.Contains(t, keys, "keep")
+	}
+	close(done)
+	<-churned
+}
+
 // umask is the process's, read the way os.Create applies it.
 func umask(t *testing.T) os.FileMode {
 	f, err := os.Create(filepath.Join(t.TempDir(), "probe"))
@@ -254,6 +318,79 @@ func serviceAccount(t *testing.T, tokenURI string) string {
 	})
 	require.NoError(t, err)
 	return string(b)
+}
+
+// A multipart upload that fails when its caller's context ends is aborted
+// anyway: its parts would stay billed.
+func TestS3AbortsAfterDeadline(t *testing.T) {
+	aborted := make(chan struct{}, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		switch {
+		case r.Method == http.MethodPost && q.Has("uploads"):
+			fmt.Fprint(w, `<InitiateMultipartUploadResult><Bucket>bucket</Bucket><Key>k</Key><UploadId>up</UploadId></InitiateMultipartUploadResult>`)
+		case r.Method == http.MethodPut && q.Has("partNumber"):
+			_, _ = io.Copy(io.Discard, r.Body)
+			time.Sleep(time.Second)
+		case r.Method == http.MethodDelete && q.Get("uploadId") == "up":
+			aborted <- struct{}{}
+			w.WriteHeader(http.StatusNoContent)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	s, err := storage.New(&storage.S3Config{AccessKey: "key", Secret: "secret", Region: "us-east-1", Endpoint: srv.URL, ForcePathStyle: true, Bucket: "bucket"})
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	require.Error(t, s.UploadObject(ctx, "k", bytes.NewReader(make([]byte, 40<<20)), storage.PutOptions{}))
+	select {
+	case <-aborted:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the upload was not aborted")
+	}
+}
+
+// The OSS SDK never retries, so this package does, for calls it can send
+// again: a 5xx or 429 is retried, a 403 is not.
+func TestAliOSSRetries(t *testing.T) {
+	var requests atomic.Int32
+	failNext := atomic.Int32{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		if code := failNext.Swap(0); code != 0 {
+			w.Header().Set("Content-Type", "application/xml")
+			w.WriteHeader(int(code))
+			fmt.Fprintf(w, `<Error><Code>Failed</Code><Message>m</Message><RequestId>r</RequestId></Error>`)
+			return
+		}
+		if r.Method == http.MethodGet {
+			fmt.Fprint(w, "hello")
+		}
+	}))
+	t.Cleanup(srv.Close)
+	s, err := storage.New(&storage.AliOSSConfig{AccessKey: "key", Secret: "secret", Endpoint: srv.URL, Bucket: "bucket"})
+	require.NoError(t, err)
+	ctx := context.Background()
+
+	for _, code := range []int32{http.StatusServiceUnavailable, http.StatusTooManyRequests} {
+		requests.Store(0)
+		failNext.Store(code)
+		require.NoError(t, s.PutObject(ctx, "k", []byte("hello"), storage.PutOptions{}))
+		require.EqualValues(t, 2, requests.Load(), "put after %d", code)
+
+		requests.Store(0)
+		failNext.Store(code)
+		got, err := s.GetObject(ctx, "k")
+		require.NoError(t, err)
+		require.Equal(t, []byte("hello"), got)
+		require.EqualValues(t, 2, requests.Load(), "get after %d", code)
+	}
+
+	requests.Store(0)
+	failNext.Store(http.StatusForbidden)
+	require.Error(t, s.PutObject(ctx, "k", []byte("hello"), storage.PutOptions{}))
+	require.EqualValues(t, 1, requests.Load(), "a 403 is not retried")
 }
 
 func selfSignedCert(t *testing.T) []byte {

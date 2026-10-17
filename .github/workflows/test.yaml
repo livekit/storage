@@ -15,18 +15,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: |
-            ~/go/pkg/mod
-            ~/go/bin
-            ~/.cache
-          key: livekit-storage
-
+      # setup-go caches the module and build caches, keyed on both modules.
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: "go.mod"
+          cache-dependency-path: |
+            go.sum
+            e2e/go.sum
 
       - name: Set up gotestfmt
         run: go install github.com/gotesttools/gotestfmt/v2/cmd/gotestfmt@9eae5abc81d6d08f73268741ef4a8b97f29b60d8 # v2.4.1
@@ -45,8 +41,8 @@ jobs:
           version: v2.14.0
           working-directory: e2e
 
-      # The e2e module holds the suites: here they run on the local backend, and
-      # on any real account whose secrets are set.
+      # The e2e module holds the suites: here they run on the local backend. The
+      # real-account tests skip, as CI passes them no credentials.
       - name: Test
         run: |
           set -euo pipefail
@@ -65,18 +61,14 @@ jobs:
         test: [FlociS3, FlociAzure, FlociGCP, FlociOCI, MinIO]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: |
-            ~/go/pkg/mod
-            ~/go/bin
-            ~/.cache
-          key: livekit-storage
-
+      # setup-go caches the module and build caches, keyed on both modules.
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: "go.mod"
+          cache-dependency-path: |
+            go.sum
+            e2e/go.sum
 
       - name: Set up gotestfmt
         run: go install github.com/gotesttools/gotestfmt/v2/cmd/gotestfmt@9eae5abc81d6d08f73268741ef4a8b97f29b60d8 # v2.4.1

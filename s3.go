@@ -21,14 +21,17 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net/http"
 	"net/url"
 	"os"
 	"path"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/aws/ratelimit"
 	"github.com/aws/aws-sdk-go-v2/aws/retry"
 	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	"github.com/aws/aws-sdk-go-v2/config"
@@ -117,8 +120,14 @@ func getConf(conf *S3Config, cp aws.CredentialsProvider) (*aws.Config, error) {
 		o.Credentials = cp
 		o.Retryer = func() aws.Retryer {
 			return retry.NewStandard(func(o *retry.StandardOptions) {
-				o.MaxAttempts = conf.MaxRetries
-				o.MaxBackoff = conf.MaxRetryDelay
+				if conf.MaxRetries > 0 {
+					o.MaxAttempts = conf.MaxRetries + 1
+				}
+				o.Backoff = retryBackoff{min: conf.MinRetryDelay, max: cmp.Or(conf.MaxRetryDelay, retry.DefaultMaxBackoff)}
+				// A Storage sends every call with one client, and the SDK's quota
+				// on retries is per client: one outage would use it up and fail
+				// every call at once.
+				o.RateLimiter = ratelimit.None
 				o.Retryables = append(o.Retryables, retry.RetryableHTTPStatusCode{
 					Codes: map[int]struct{}{
 						http.StatusConflict:        {},
@@ -134,17 +143,12 @@ func getConf(conf *S3Config, cp aws.CredentialsProvider) (*aws.Config, error) {
 		if err != nil {
 			return err
 		}
-		// "Legacy" is the SDK's default when AWS_DEFAULTS_MODE is unset, so
-		// this pins what main ran with. Every other mode only swaps in its own
-		// connect and TLS timeouts (1.1s to 30s), and does it by replacing the
-		// dialer, which drops the idle timeout setTimeouts puts on it. This
-		// package sets those timeouts itself, and retries with its own retryer,
-		// which no mode changes.
-		o.DefaultsModeOptions.Mode = aws.DefaultsModeLegacy
-		// The SDK's read timeout is off: setTimeouts bounds reads and writes.
+		// The idle timeout goes on in newS3Client: a defaults mode
+		// (AWS_DEFAULTS_MODE) replaces the dialer when a client is made. The
+		// SDK's read timeout is off, as the idle timeout bounds reads and writes.
 		o.HTTPClient = awshttp.NewBuildableClient().
 			WithDialerOptions(setDialTimeouts).
-			WithTransportOptions(setTimeouts, setProxy).
+			WithTransportOptions(func(t *http.Transport) { t.TLSHandshakeTimeout = tlsHandshakeTimeout }, setProxy).
 			WithReadTimeout(0)
 
 		return nil
@@ -167,7 +171,9 @@ func updateRegion(awsConf *aws.Config, bucket string) error {
 		Bucket: &bucket,
 	}
 
-	resp, err := s3.NewFromConfig(*awsConf).GetBucketLocation(context.Background(), req)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	resp, err := s3.NewFromConfig(*awsConf).GetBucketLocation(ctx, req)
 	if err != nil {
 		return wrapS3Error(err)
 	}
@@ -179,21 +185,58 @@ func updateRegion(awsConf *aws.Config, bucket string) error {
 	return nil
 }
 
+// retryBackoff waits a random time between min and a ceiling that doubles
+// from a second each attempt, up to max: the SDK's full jitter, with a floor.
+type retryBackoff struct{ min, max time.Duration }
+
+func (b retryBackoff) BackoffDelay(attempt int, _ error) (time.Duration, error) {
+	ceiling := b.max
+	if attempt < 30 {
+		ceiling = min(b.max, time.Second<<attempt)
+	}
+	if ceiling <= b.min {
+		return b.min, nil
+	}
+	return b.min + rand.N(ceiling-b.min), nil
+}
+
 // newS3Client is the one client a Storage sends with, so calls share its
 // connections.
 func newS3Client(awsConf *aws.Config, conf *S3Config) *s3.Client {
 	return s3.NewFromConfig(*awsConf, func(o *s3.Options) {
 		o.UsePathStyle = conf.ForcePathStyle
 
-		if conf.Endpoint != "" {
-			// needed for compatibility with non-AWS S3-compatible providers (Oracle, etc.)
+		// Stores other than AWS take only the checksums an operation requires:
+		// many reject the CRC32 trailers (aws-chunked) the SDK sends by default.
+		// AWS hosts, VPC and FIPS endpoints among them, keep the defaults,
+		// which Object Lock buckets need.
+		if !awsEndpoint(conf.Endpoint) {
 			o.RequestChecksumCalculation = aws.RequestChecksumCalculationWhenRequired
 			o.ResponseChecksumValidation = aws.ResponseChecksumValidationWhenRequired
+		}
+
+		// Options run after the SDK sets up the HTTP client, which a defaults
+		// mode does by replacing the dialer the idle timeout wraps.
+		if b, ok := o.HTTPClient.(*awshttp.BuildableClient); ok {
+			o.HTTPClient = b.WithTransportOptions(setIdleTimeout)
 		}
 	})
 }
 
-func (s *s3Storage) UploadFile(ctx context.Context, filepath, storagePath, contentType string) (string, int64, error) {
+// awsEndpoint reports whether endpoint, empty for the SDK's own, is AWS's.
+func awsEndpoint(endpoint string) bool {
+	if endpoint == "" {
+		return true
+	}
+	u, err := url.Parse(endpoint)
+	if err != nil {
+		return false
+	}
+	host := u.Hostname()
+	return strings.HasSuffix(host, ".amazonaws.com") || strings.HasSuffix(host, ".amazonaws.com.cn")
+}
+
+func (s *s3Storage) UploadFile(ctx context.Context, storagePath, filepath string, opts PutOptions) (string, int64, error) {
 	file, err := os.Open(filepath)
 	if err != nil {
 		return "", 0, err
@@ -204,35 +247,70 @@ func (s *s3Storage) UploadFile(ctx context.Context, filepath, storagePath, conte
 	if err != nil {
 		return "", 0, err
 	}
-	if err = s.upload(ctx, file, storagePath, contentType); err != nil {
+	if opts.IfAbsent && presentBeforeUpload(ctx, s, storagePath) {
+		return "", 0, ErrExists
+	}
+	if err = s.upload(ctx, file, storagePath, opts); err != nil {
 		return "", 0, err
 	}
 	return s.location(storagePath), stat.Size(), nil
 }
 
-func (s *s3Storage) upload(ctx context.Context, body io.Reader, storagePath, contentType string) error {
-	// The SDK's request log is kept, and written only when the upload fails.
-	l := news3Logger()
+func (s *s3Storage) upload(ctx context.Context, body io.Reader, storagePath string, opts PutOptions) error {
+	// The SDK's log is kept, and written only when the upload fails. Requests
+	// are left out: their dump carries the session token.
+	l := newS3Logger()
 	logTo := func(u *manager.Uploader) {
 		u.ClientOptions = append(u.ClientOptions, func(o *s3.Options) {
 			o.Logger = l
-			o.ClientLogMode = aws.LogRequest | aws.LogResponse | aws.LogRetries
+			o.ClientLogMode = aws.LogResponse | aws.LogRetries
 		})
 	}
-	if _, err := s.uploader(s.client, logTo).Upload(ctx, s.putInput(storagePath, body, PutOptions{ContentType: contentType})); err != nil {
+	input := s.putInput(storagePath, body, opts)
+	if opts.IfAbsent {
+		input.IfNoneMatch = aws.String("*")
+	}
+	if err := s.send(ctx, input, logTo); err != nil {
 		l.WriteLogs()
-		return wrapS3Error(err)
+		return wrapS3WriteError(err, opts.IfAbsent)
 	}
 	return nil
 }
 
-func (s *s3Storage) uploader(client *s3.Client, opts ...func(*manager.Uploader)) *manager.Uploader {
+// send uploads input in parts of s3UploadPartSize when it is larger than one.
+// A failed multipart upload is aborted on a context of its own: the SDK would
+// abort with the caller's, which is often why it failed, and leave the parts
+// billed.
+func (s *s3Storage) send(ctx context.Context, input *s3.PutObjectInput, opts ...func(*manager.Uploader)) error {
+	opts = append(opts, func(u *manager.Uploader) {
+		u.PartSize = s3UploadPartSize
+		u.LeavePartsOnError = true
+	})
+	_, err := s.uploader(opts...).Upload(ctx, input)
+	var failed manager.MultiUploadFailure
+	if errors.As(err, &failed) {
+		go s.abort(context.WithoutCancel(ctx), input.Key, failed.UploadID())
+	}
+	return err
+}
+
+func (s *s3Storage) abort(ctx context.Context, key *string, uploadID string) {
+	ctx, cancel := context.WithTimeout(ctx, time.Minute)
+	defer cancel()
+	_, _ = s.client.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{
+		Bucket:   aws.String(s.conf.Bucket),
+		Key:      key,
+		UploadId: aws.String(uploadID),
+	})
+}
+
+func (s *s3Storage) uploader(opts ...func(*manager.Uploader)) *manager.Uploader {
 	// Uploader forces a CRC32 ChecksumAlgorithm on multipart uploads,
 	// which makes UploadPart use a trailing checksum encoded as Content-Encoding:
 	// aws-chunked. Non-AWS S3-compatible providers (e.g. OCI) don't support
 	// this, so clear the algorithm before any checksum middleware sees it.
-	return manager.NewUploader(client, append(opts, func(u *manager.Uploader) {
-		if s.conf.Endpoint != "" {
+	return manager.NewUploader(s.client, append(opts, func(u *manager.Uploader) {
+		if !awsEndpoint(s.conf.Endpoint) {
 			u.ClientOptions = append(u.ClientOptions, func(o *s3.Options) {
 				o.APIOptions = append(o.APIOptions, func(stack *middleware.Stack) error {
 					return stack.Initialize.Add(middleware.InitializeMiddlewareFunc(
@@ -274,14 +352,10 @@ func (s *s3Storage) location(storagePath string) string {
 	return loc.String()
 }
 
-func (s *s3Storage) DownloadFile(ctx context.Context, filepath, storagePath string) (int64, error) {
-	file, err := os.Create(filepath)
-	if err != nil {
-		return 0, err
-	}
-	defer file.Close()
-
-	return s.downloadRanges(ctx, file, storagePath)
+func (s *s3Storage) DownloadFile(ctx context.Context, storagePath, filepath string) (int64, error) {
+	return downloadFile(filepath, func(f *os.File) (int64, error) {
+		return s.downloadRanges(ctx, f, storagePath)
+	})
 }
 
 // downloadRanges fetches the object in parallel ranges, each retried on its own.
@@ -301,7 +375,7 @@ func (s *s3Storage) PutObject(ctx context.Context, storagePath string, data []by
 		input.IfNoneMatch = aws.String("*")
 	}
 	_, err := s.client.PutObject(ctx, input)
-	return wrapS3ObjectError(err)
+	return wrapS3WriteError(err, opts.IfAbsent)
 }
 
 // UploadObject checks IfAbsent before uploading, which spares a refused upload
@@ -312,14 +386,10 @@ func (s *s3Storage) UploadObject(ctx context.Context, storagePath string, body i
 		return ErrExists
 	}
 	input := s.putInput(storagePath, body, opts)
-	uploader := s.uploader(s.client, func(u *manager.Uploader) {
-		u.PartSize = s3UploadPartSize
-	})
 	if opts.IfAbsent {
 		input.IfNoneMatch = aws.String("*")
 	}
-	_, err := uploader.Upload(ctx, input)
-	return wrapS3ObjectError(err)
+	return wrapS3WriteError(s.send(ctx, input), opts.IfAbsent)
 }
 
 // putInput is every write's request: the content type, and the metadata,
@@ -358,8 +428,11 @@ func (s *s3Storage) GetObjectRange(ctx context.Context, storagePath string, offs
 		Key:    aws.String(storagePath),
 		Range:  aws.String(fmt.Sprintf("bytes=%d-%d", offset, offset+length-1)),
 	})
+	// A range past the end; some stores answer a bare 416, with no code.
 	var apiErr smithy.APIError
-	if errors.As(err, &apiErr) && apiErr.ErrorCode() == "InvalidRange" {
+	var status interface{ HTTPStatusCode() int }
+	if (errors.As(err, &apiErr) && apiErr.ErrorCode() == "InvalidRange") ||
+		(errors.As(err, &status) && status.HTTPStatusCode() == http.StatusRequestedRangeNotSatisfiable) {
 		return []byte{}, nil
 	}
 	if err != nil {
@@ -412,6 +485,7 @@ func (s *s3Storage) ListObjects(ctx context.Context, prefix string) ([]string, e
 			keys = append(keys, aws.ToString(obj.Key))
 		}
 	}
+	slices.Sort(keys)
 	return keys, nil
 }
 
@@ -428,7 +502,9 @@ func (s *s3Storage) DeleteObjects(ctx context.Context, storagePaths []string) er
 			Bucket: aws.String(s.conf.Bucket),
 			Delete: &types.Delete{Objects: objects, Quiet: aws.Bool(true)},
 		}
-		if s.conf.Endpoint != "" {
+		// The request needs an integrity header: stores other than AWS take
+		// SHA-256 (OCI takes it or CRC32C), not the SDK's default CRC32.
+		if !awsEndpoint(s.conf.Endpoint) {
 			input.ChecksumAlgorithm = types.ChecksumAlgorithmSha256
 		}
 		out, err := client.DeleteObjects(ctx, input)
@@ -477,9 +553,19 @@ func wrapS3ObjectError(err error) error {
 		switch apiErr.ErrorCode() {
 		case "NoSuchKey", "NotFound", "404":
 			return fmt.Errorf("%w: %w", ErrNotFound, wrapS3Error(err))
-		case "PreconditionFailed":
-			return fmt.Errorf("%w: %w", ErrExists, wrapS3Error(err))
 		}
 	}
 	return wrapS3Error(err)
+}
+
+// wrapS3WriteError is wrapS3ObjectError with a failed precondition as
+// ErrExists where IfAbsent set one. A read can fail one too: the downloader
+// pins each range to the first's ETag, and an object replaced mid-read is no
+// object that exists.
+func wrapS3WriteError(err error, ifAbsent bool) error {
+	var apiErr smithy.APIError
+	if ifAbsent && errors.As(err, &apiErr) && apiErr.ErrorCode() == "PreconditionFailed" {
+		return fmt.Errorf("%w: %w", ErrExists, wrapS3Error(err))
+	}
+	return wrapS3ObjectError(err)
 }

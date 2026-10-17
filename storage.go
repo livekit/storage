@@ -12,19 +12,30 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Package storage is object storage on S3 and S3-compatible stores, GCS,
+// Azure Blob, OCI Object Storage, AliOSS and a local directory, behind the
+// interfaces in storage/objects. New builds a Storage from a config.
 package storage
 
 import (
-	"sync/atomic"
-
 	"bytes"
 	"context"
-	"encoding/base64"
-	"golang.org/x/sync/errgroup"
+	"errors"
+	"io"
+	"io/fs"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync/atomic"
 	"time"
+
+	"golang.org/x/net/http/httpproxy"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/livekit/storage/objects"
 )
@@ -62,6 +73,63 @@ func getObject(ctx context.Context, s Bucket, storagePath string) ([]byte, error
 		return nil, err
 	}
 	return buf.Bytes(), nil
+}
+
+// createFile opens name for writing, with its parents, in the mode os.Create
+// gives, 0666 less the umask, so other users, such as a host reading a
+// container's volume, can read it. A delete can remove the parent once empty
+// before the file is in it, so it is made again.
+func createFile(name string, flag int) (*os.File, error) {
+	for {
+		if err := os.MkdirAll(filepath.Dir(name), 0o755); err != nil {
+			return nil, err
+		}
+		f, err := os.OpenFile(name, os.O_RDWR|os.O_CREATE|flag, 0o666)
+		if !errors.Is(err, fs.ErrNotExist) {
+			return f, err
+		}
+	}
+}
+
+// createTemp is a new file in dir named prefix and a random suffix.
+func createTemp(dir, prefix string) (*os.File, error) {
+	for {
+		f, err := createFile(filepath.Join(dir, prefix+strconv.FormatUint(rand.Uint64(), 36)), os.O_EXCL)
+		if !errors.Is(err, fs.ErrExist) {
+			return f, err
+		}
+	}
+}
+
+// writeFile copies body into f, syncs and closes it.
+func writeFile(f *os.File, body io.Reader) (int64, error) {
+	n, err := io.Copy(f, body)
+	if err == nil {
+		err = f.Sync()
+	}
+	if closeErr := f.Close(); err == nil {
+		err = closeErr
+	}
+	return n, err
+}
+
+// downloadFile fetches an object into a file beside name, renamed to name once
+// complete, so a missing object or a failed download leaves name as it was.
+func downloadFile(name string, fetch func(f *os.File) (int64, error)) (int64, error) {
+	tmp, err := createTemp(filepath.Dir(name), "."+filepath.Base(name)+".download-")
+	if err != nil {
+		return 0, err
+	}
+	defer os.Remove(tmp.Name())
+
+	n, err := fetch(tmp)
+	if closeErr := tmp.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		return 0, err
+	}
+	return n, os.Rename(tmp.Name(), name)
 }
 
 // The clients this package builds cut a connection that stalls, never a slow
@@ -124,33 +192,84 @@ func setIdleTimeout(t *http.Transport) {
 		setDialTimeouts(d)
 		dial = d.DialContext
 	}
+	timeout := idleTimeout
 	t.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
 		conn, err := dial(ctx, network, addr)
 		if err != nil {
 			return nil, err
 		}
-		return idleConn{conn}, nil
+		return &idleConn{Conn: conn, timeout: timeout}, nil
 	}
 }
 
-// idleConn fails once no bytes move either way for idleTimeout. Each read or
-// write moves both deadlines: the transport's read for the response is already
-// waiting while a long body is still being written.
-type idleConn struct{ net.Conn }
+// idleConn fails once no bytes move either way for timeout. Each read or write
+// moves both deadlines: the transport's read for the response is already
+// waiting while a long body is still being written. A deadline set from above,
+// such as TLS's on close or net/http's to interrupt a read, is never extended.
+type idleConn struct {
+	net.Conn
+	timeout time.Duration
+	// readBy and writeBy are the deadlines set from above, in Unix
+	// nanoseconds, 0 for none.
+	readBy, writeBy atomic.Int64
+}
 
-func (c idleConn) Read(p []byte) (int, error) {
-	if err := c.SetDeadline(time.Now().Add(idleTimeout)); err != nil {
+func (c *idleConn) Read(p []byte) (int, error) {
+	if err := c.extend(); err != nil {
 		return 0, err
 	}
 	return c.Conn.Read(p)
 }
 
-func (c idleConn) Write(p []byte) (int, error) {
-	if err := c.SetDeadline(time.Now().Add(idleTimeout)); err != nil {
+func (c *idleConn) Write(p []byte) (int, error) {
+	if err := c.extend(); err != nil {
 		return 0, err
 	}
 	return c.Conn.Write(p)
 }
+
+func (c *idleConn) extend() error {
+	idle := time.Now().Add(c.timeout)
+	if err := c.Conn.SetReadDeadline(earliest(idle, c.readBy.Load())); err != nil {
+		return err
+	}
+	return c.Conn.SetWriteDeadline(earliest(idle, c.writeBy.Load()))
+}
+
+func (c *idleConn) SetDeadline(t time.Time) error {
+	c.readBy.Store(unixNano(t))
+	c.writeBy.Store(unixNano(t))
+	return c.Conn.SetDeadline(t)
+}
+
+func (c *idleConn) SetReadDeadline(t time.Time) error {
+	c.readBy.Store(unixNano(t))
+	return c.Conn.SetReadDeadline(t)
+}
+
+func (c *idleConn) SetWriteDeadline(t time.Time) error {
+	c.writeBy.Store(unixNano(t))
+	return c.Conn.SetWriteDeadline(t)
+}
+
+// earliest is idle, or the deadline set from above when that comes first.
+func earliest(idle time.Time, by int64) time.Time {
+	if by != 0 && by < idle.UnixNano() {
+		return time.Unix(0, by)
+	}
+	return idle
+}
+
+func unixNano(t time.Time) int64 {
+	if t.IsZero() {
+		return 0
+	}
+	return t.UnixNano()
+}
+
+// maxIdleConnsPerHost keeps a connection for each request a call can have in
+// flight, deletes and upload blocks: Go's default keeps two and redials the rest.
+const maxIdleConnsPerHost = 32
 
 // transportWithTimeouts is a clone of t, or of Go's default transport, with
 // every timeout set.
@@ -169,6 +288,7 @@ func transportWithTimeouts(rt http.RoundTripper) *http.Transport {
 			ExpectContinueTimeout: time.Second,
 		}
 	}
+	t.MaxIdleConnsPerHost = max(t.MaxIdleConnsPerHost, maxIdleConnsPerHost)
 	setTimeouts(t)
 	return t
 }
@@ -183,11 +303,23 @@ func proxySetter(p *ProxyConfig) (func(*http.Transport), error) {
 	if err != nil {
 		return nil, err
 	}
+	// Credentials in the URL go to the proxy for http targets as well as on
+	// CONNECT for https ones.
+	if p.Username != "" && p.Password != "" {
+		u.User = url.UserPassword(p.Username, p.Password)
+	}
+	// NO_PROXY is honored, and the cloud metadata services, which hand out
+	// instance credentials, are never proxied: a proxy cannot reach them.
+	proxy := (&httpproxy.Config{
+		HTTPProxy:  u.String(),
+		HTTPSProxy: u.String(),
+		NoProxy:    strings.Join([]string{os.Getenv("NO_PROXY"), os.Getenv("no_proxy"), metadataHosts}, ","),
+	}).ProxyFunc()
 	return func(t *http.Transport) {
-		t.Proxy = http.ProxyURL(u)
-		if p.Username != "" && p.Password != "" {
-			auth := base64.StdEncoding.EncodeToString([]byte(p.Username + ":" + p.Password))
-			t.ProxyConnectHeader = http.Header{"Proxy-Authorization": {"Basic " + auth}}
-		}
+		t.Proxy = func(r *http.Request) (*url.URL, error) { return proxy(r.URL) }
 	}, nil
 }
+
+// metadataHosts are the instance metadata and container credential endpoints
+// of EC2, ECS, EKS Pod Identity and GCE.
+const metadataHosts = "169.254.169.254,169.254.170.2,169.254.170.23,fd00:ec2::254,fd00:ec2::23,metadata.google.internal"
