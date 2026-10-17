@@ -219,7 +219,7 @@ func (s *ociStorage) download(storagePath string) (objectstorage.GetObjectRespon
 		BucketName:    &s.conf.Bucket,
 		ObjectName:    &storagePath,
 	})
-	return resp, wrapOCIError(err)
+	return resp, wrapOCIObjectError(err)
 }
 
 // GeneratePresignedUrl creates a pre-authenticated request. Unlike an S3

@@ -18,7 +18,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"sort"
 	"testing"
 	"time"
 
@@ -78,6 +77,8 @@ func testObjects(t *testing.T, s storage.Storage) {
 		require.ErrorIs(t, err, storage.ErrObjectNotFound)
 		_, err = s.GetObjectRange(ctx, missing, 0, 1)
 		require.ErrorIs(t, err, storage.ErrObjectNotFound)
+		_, err = s.DownloadData(missing)
+		require.ErrorIs(t, err, storage.ErrObjectNotFound)
 		exists, err := s.ObjectExists(ctx, missing)
 		require.NoError(t, err)
 		require.False(t, exists)
@@ -89,7 +90,6 @@ func testObjects(t *testing.T, s storage.Storage) {
 	t.Run("ListObjects and DeleteObjects", func(t *testing.T) {
 		keys, err := s.ListObjects(ctx, prefix)
 		require.NoError(t, err)
-		sort.Strings(keys)
 		require.Equal(t, []string{large, small}, keys)
 		require.NoError(t, s.DeleteObjects(ctx, []string{small, large, missing}))
 		keys, err = s.ListObjects(ctx, prefix)

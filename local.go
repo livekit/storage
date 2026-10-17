@@ -149,7 +149,8 @@ func (u *localUploader) listObjects(prefix string) ([]string, error) {
 }
 
 func (u *localUploader) DownloadData(storagePath string) ([]byte, error) {
-	return os.ReadFile(path.Join(u.StorageDir, storagePath))
+	data, err := os.ReadFile(path.Join(u.StorageDir, storagePath))
+	return data, localObjectError(err)
 }
 
 func (u *localUploader) DownloadFile(localPath, storagePath string) (int64, error) {
@@ -157,7 +158,7 @@ func (u *localUploader) DownloadFile(localPath, storagePath string) (int64, erro
 
 	storage, err := os.Open(storagePath)
 	if err != nil {
-		return 0, err
+		return 0, localObjectError(err)
 	}
 	defer storage.Close()
 
@@ -284,9 +285,11 @@ func (u *localUploader) ObjectExists(_ context.Context, storagePath string) (boo
 // a crash.
 func (u *localUploader) ListObjects(_ context.Context, prefix string) ([]string, error) {
 	keys, err := u.listObjects(prefix)
-	return slices.DeleteFunc(keys, func(k string) bool {
+	keys = slices.DeleteFunc(keys, func(k string) bool {
 		return strings.HasPrefix(filepath.Base(k), localUploadPrefix)
-	}), err
+	})
+	slices.Sort(keys)
+	return keys, err
 }
 
 func (u *localUploader) DeleteObjects(_ context.Context, storagePaths []string) error {

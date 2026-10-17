@@ -331,7 +331,7 @@ func (s *s3Storage) download(w io.WriterAt, storagePath string) (int64, error) {
 			Key:    aws.String(storagePath),
 		},
 	)
-	return n, wrapS3Error(err)
+	return n, wrapS3ObjectError(err)
 }
 
 func (s *s3Storage) DeleteObject(storagePath string) error {
@@ -429,6 +429,10 @@ func (s *s3Storage) GetObjectRange(ctx context.Context, storagePath string, offs
 		return nil, wrapS3ObjectError(err)
 	}
 	defer out.Body.Close()
+	// A store that ignores Range answers with the whole object.
+	if out.ContentRange == nil {
+		return nil, fmt.Errorf("storage: %s answered without Content-Range", storagePath)
+	}
 	return io.ReadAll(io.LimitReader(out.Body, length))
 }
 

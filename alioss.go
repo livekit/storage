@@ -104,7 +104,7 @@ func (s *aliOSSStorage) location(storagePath string) string {
 func (s *aliOSSStorage) DownloadData(storagePath string) ([]byte, error) {
 	reader, err := s.bucket.GetObject(storagePath)
 	if err != nil {
-		return nil, wrapAliOSSError(err)
+		return nil, wrapAliOSSObjectError(err)
 	}
 	defer reader.Close()
 
@@ -117,7 +117,7 @@ func (s *aliOSSStorage) DownloadData(storagePath string) ([]byte, error) {
 
 func (s *aliOSSStorage) DownloadFile(filepath, storagePath string) (int64, error) {
 	if err := s.bucket.GetObjectToFile(storagePath, filepath); err != nil {
-		return 0, wrapAliOSSError(err)
+		return 0, wrapAliOSSObjectError(err)
 	}
 
 	info, err := os.Stat(filepath)

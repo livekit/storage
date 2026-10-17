@@ -21,10 +21,11 @@ import (
 	"github.com/livekit/storage/objects"
 )
 
-// The interface lives in storage/objects so that code implementing or
-// accepting it without creating one doesn't pull in every provider SDK.
+// The interfaces live in storage/objects so that code implementing or
+// accepting them without creating one doesn't pull in every provider SDK.
 type (
 	Storage    = objects.Storage
+	Bucket     = objects.Bucket
 	PutOptions = objects.PutOptions
 )
 

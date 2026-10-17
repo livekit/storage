@@ -196,7 +196,7 @@ func (s *gcpStorage) download(storagePath string) (*storage.Reader, error) {
 		storage.WithPolicy(storage.RetryAlways),
 	).NewReader(context.Background())
 	if err != nil {
-		return nil, wrapGCPError(err)
+		return nil, wrapGCPObjectError(err)
 	}
 	return r, nil
 }

@@ -128,7 +128,7 @@ func (s *azureBLOBStorage) DownloadData(storagePath string) ([]byte, error) {
 
 	props, err := blobClient.GetProperties(ctx, nil)
 	if err != nil {
-		return nil, wrapAzureError(err)
+		return nil, wrapAzureObjectError(err)
 	}
 	if props.ContentLength == nil {
 		return nil, errors.New("azure: missing content length")
@@ -140,7 +140,7 @@ func (s *azureBLOBStorage) DownloadData(storagePath string) ([]byte, error) {
 		Concurrency: azureParallelism,
 	})
 	if err != nil {
-		return nil, wrapAzureError(err)
+		return nil, wrapAzureObjectError(err)
 	}
 	return buf, nil
 }
@@ -157,7 +157,7 @@ func (s *azureBLOBStorage) DownloadFile(filepath, storagePath string) (int64, er
 		Concurrency: azureParallelism,
 	})
 	if err != nil {
-		return 0, wrapAzureError(err)
+		return 0, wrapAzureObjectError(err)
 	}
 
 	stat, err := file.Stat()
