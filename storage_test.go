@@ -223,7 +223,7 @@ func testStorage(t *testing.T, s storage.Storage) {
 	})
 
 	t.Run("UploadData", func(t *testing.T) {
-		loc, size, err := s.UploadData(dataPayload, pathData, "text/plain")
+		loc, size, err := s.UploadData(context.Background(), dataPayload, pathData, "text/plain")
 		require.NoError(t, err)
 		require.Equal(t, int64(len(dataPayload)), size)
 		assertLocation(t, loc, pathData)
@@ -238,7 +238,7 @@ func testStorage(t *testing.T, s storage.Storage) {
 		require.NoError(t, err)
 		require.NoError(t, tmp.Close())
 
-		loc, size, err := s.UploadFile(tmp.Name(), pathFile, "text/plain")
+		loc, size, err := s.UploadFile(context.Background(), tmp.Name(), pathFile, "text/plain")
 		require.NoError(t, err)
 		require.Equal(t, int64(len(filePayload)), size)
 		assertLocation(t, loc, pathFile)
@@ -254,7 +254,7 @@ func testStorage(t *testing.T, s storage.Storage) {
 	})
 
 	t.Run("DownloadData", func(t *testing.T) {
-		downloaded, err := s.DownloadData(pathData)
+		downloaded, err := s.GetObject(context.Background(), pathData)
 		require.NoError(t, err)
 		require.Equal(t, dataPayload, downloaded)
 	})
@@ -265,7 +265,7 @@ func testStorage(t *testing.T, s storage.Storage) {
 		require.NoError(t, tmp.Close())
 		defer os.Remove(tmp.Name())
 
-		size, err := s.DownloadFile(tmp.Name(), pathFile)
+		size, err := s.DownloadFile(context.Background(), tmp.Name(), pathFile)
 		require.NoError(t, err)
 		require.Equal(t, int64(len(filePayload)), size)
 
@@ -303,8 +303,8 @@ func testStorage(t *testing.T, s storage.Storage) {
 		require.Equal(t, dataPayload, body)
 	})
 
-	t.Run("DeleteObject", func(t *testing.T) {
-		require.NoError(t, s.DeleteObject(pathData))
+	t.Run("DeleteObjects one path", func(t *testing.T) {
+		require.NoError(t, s.DeleteObjects(context.Background(), []string{pathData}))
 
 		items, err := s.ListObjects(context.Background(), prefix)
 		require.NoError(t, err)
@@ -314,9 +314,9 @@ func testStorage(t *testing.T, s storage.Storage) {
 
 	t.Run("DeleteObjects", func(t *testing.T) {
 		// Upload two more objects, then bulk-delete them along with the leftover pathFile.
-		_, _, err := s.UploadData(bulk1Payload, pathBulk1, "text/plain")
+		_, _, err := s.UploadData(context.Background(), bulk1Payload, pathBulk1, "text/plain")
 		require.NoError(t, err)
-		_, _, err = s.UploadData(bulk2Payload, pathBulk2, "text/plain")
+		_, _, err = s.UploadData(context.Background(), bulk2Payload, pathBulk2, "text/plain")
 		require.NoError(t, err)
 
 		require.NoError(t, s.DeleteObjects(context.Background(), []string{pathFile, pathBulk1, pathBulk2}))
@@ -329,7 +329,7 @@ func testStorage(t *testing.T, s storage.Storage) {
 	t.Run("Multipart", func(t *testing.T) {
 		pathMultipart := prefix + "-multipart.bin"
 		t.Cleanup(func() {
-			_ = s.DeleteObject(pathMultipart)
+			_ = s.DeleteObjects(context.Background(), []string{pathMultipart})
 		})
 
 		// 6 MiB exceeds the S3 manager's default 5 MiB part size, forcing the
@@ -339,12 +339,12 @@ func testStorage(t *testing.T, s storage.Storage) {
 			payload[i] = byte(i)
 		}
 
-		loc, size, err := s.UploadData(payload, pathMultipart, "application/octet-stream")
+		loc, size, err := s.UploadData(context.Background(), payload, pathMultipart, "application/octet-stream")
 		require.NoError(t, err)
 		require.Equal(t, int64(len(payload)), size)
 		assertLocation(t, loc, pathMultipart)
 
-		downloaded, err := s.DownloadData(pathMultipart)
+		downloaded, err := s.GetObject(context.Background(), pathMultipart)
 		require.NoError(t, err)
 		require.Equal(t, len(payload), len(downloaded))
 		require.True(t, bytes.Equal(payload, downloaded), "downloaded multipart content does not match uploaded")

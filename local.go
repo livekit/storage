@@ -45,56 +45,28 @@ func NewLocal(conf *LocalConfig) (Storage, error) {
 	}, nil
 }
 
-func (u *localUploader) UploadFile(localPath, storagePath string, _ string) (string, int64, error) {
-	storagePath = u.location(storagePath)
-
-	local, err := os.Open(localPath)
+func (u *localUploader) UploadFile(ctx context.Context, localPath, storagePath, _ string) (string, int64, error) {
+	file, err := os.Open(localPath)
 	if err != nil {
 		return "", 0, err
 	}
-	defer local.Close()
+	defer file.Close()
 
-	if dir, _ := path.Split(storagePath); dir != "" {
-		if err = os.MkdirAll(dir, 0755); err != nil {
-			return "", 0, err
-		}
-	}
-
-	storage, err := os.Create(storagePath)
+	stat, err := file.Stat()
 	if err != nil {
 		return "", 0, err
 	}
-	defer storage.Close()
-
-	size, err := io.Copy(storage, local)
-	if err != nil {
+	if err = u.UploadObject(ctx, storagePath, file, PutOptions{}); err != nil {
 		return "", 0, err
 	}
-
-	return storagePath, size, nil
+	return u.location(storagePath), stat.Size(), nil
 }
 
-func (u *localUploader) UploadData(data []byte, storagePath, _ string) (string, int64, error) {
-	storagePath = u.location(storagePath)
-
-	if dir, _ := path.Split(storagePath); dir != "" {
-		if err := os.MkdirAll(dir, 0755); err != nil {
-			return "", 0, err
-		}
-	}
-
-	storage, err := os.Create(storagePath)
-	if err != nil {
+func (u *localUploader) UploadData(ctx context.Context, data []byte, storagePath, _ string) (string, int64, error) {
+	if err := u.PutObject(ctx, storagePath, data, PutOptions{}); err != nil {
 		return "", 0, err
 	}
-	defer storage.Close()
-
-	size, err := storage.Write(data)
-	if err != nil {
-		return "", 0, err
-	}
-
-	return storagePath, int64(size), nil
+	return u.location(storagePath), int64(len(data)), nil
 }
 
 func (u *localUploader) location(storagePath string) string {
@@ -148,12 +120,7 @@ func (u *localUploader) listObjects(prefix string) ([]string, error) {
 	return files, nil
 }
 
-func (u *localUploader) DownloadData(storagePath string) ([]byte, error) {
-	data, err := os.ReadFile(path.Join(u.StorageDir, storagePath))
-	return data, localObjectError(err)
-}
-
-func (u *localUploader) DownloadFile(localPath, storagePath string) (int64, error) {
+func (u *localUploader) DownloadFile(_ context.Context, localPath, storagePath string) (int64, error) {
 	storagePath = path.Join(u.StorageDir, storagePath)
 
 	storage, err := os.Open(storagePath)
@@ -187,7 +154,8 @@ func (u *localUploader) presignedUrl(storagePath string, _ time.Duration) (strin
 	return (&url.URL{Scheme: "file", Path: filepath.ToSlash(abs)}).String(), nil
 }
 
-func (u *localUploader) DeleteObject(storagePath string) error {
+// deleteObject removes the file, then each parent directory it leaves empty.
+func (u *localUploader) deleteObject(storagePath string) error {
 	storagePath = path.Join(u.StorageDir, storagePath)
 
 	for {
@@ -294,7 +262,7 @@ func (u *localUploader) ListObjects(_ context.Context, prefix string) ([]string,
 
 func (u *localUploader) DeleteObjects(_ context.Context, storagePaths []string) error {
 	for _, p := range storagePaths {
-		if err := u.DeleteObject(p); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		if err := u.deleteObject(p); err != nil && !errors.Is(err, fs.ErrNotExist) {
 			return err
 		}
 	}

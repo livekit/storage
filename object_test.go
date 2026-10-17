@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -77,7 +78,7 @@ func testObjects(t *testing.T, s storage.Storage) {
 		require.ErrorIs(t, err, storage.ErrObjectNotFound)
 		_, err = s.GetObjectRange(ctx, missing, 0, 1)
 		require.ErrorIs(t, err, storage.ErrObjectNotFound)
-		_, err = s.DownloadData(missing)
+		_, err = s.DownloadFile(ctx, filepath.Join(t.TempDir(), "missing"), missing)
 		require.ErrorIs(t, err, storage.ErrObjectNotFound)
 		exists, err := s.ObjectExists(ctx, missing)
 		require.NoError(t, err)

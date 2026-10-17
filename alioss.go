@@ -72,25 +72,21 @@ func NewAliOSS(conf *AliOSSConfig) (Storage, error) {
 	}, nil
 }
 
-func (s *aliOSSStorage) UploadData(data []byte, storagePath, contentType string) (string, int64, error) {
-	reader := bytes.NewBuffer(data)
-	if err := s.bucket.PutObject(storagePath, reader, oss.ContentType(contentType)); err != nil {
-		return "", 0, wrapAliOSSError(err)
+func (s *aliOSSStorage) UploadData(ctx context.Context, data []byte, storagePath, contentType string) (string, int64, error) {
+	if err := s.PutObject(ctx, storagePath, data, PutOptions{ContentType: contentType}); err != nil {
+		return "", 0, err
 	}
-
 	return s.location(storagePath), int64(len(data)), nil
 }
 
-func (s *aliOSSStorage) UploadFile(filepath, storagePath, contentType string) (string, int64, error) {
+func (s *aliOSSStorage) UploadFile(ctx context.Context, filepath, storagePath, contentType string) (string, int64, error) {
 	info, err := os.Stat(filepath)
 	if err != nil {
 		return "", 0, err
 	}
-
-	if err = s.bucket.PutObjectFromFile(storagePath, filepath, oss.ContentType(contentType)); err != nil {
+	if err = s.bucket.PutObjectFromFile(storagePath, filepath, oss.ContentType(contentType), oss.WithContext(ctx)); err != nil {
 		return "", 0, wrapAliOSSError(err)
 	}
-
 	return s.location(storagePath), info.Size(), nil
 }
 
@@ -101,30 +97,14 @@ func (s *aliOSSStorage) location(storagePath string) string {
 	return u.String()
 }
 
-func (s *aliOSSStorage) DownloadData(storagePath string) ([]byte, error) {
-	reader, err := s.bucket.GetObject(storagePath)
-	if err != nil {
-		return nil, wrapAliOSSObjectError(err)
-	}
-	defer reader.Close()
-
-	data, err := io.ReadAll(reader)
-	if err != nil {
-		return nil, wrapAliOSSError(err)
-	}
-	return data, nil
-}
-
-func (s *aliOSSStorage) DownloadFile(filepath, storagePath string) (int64, error) {
-	if err := s.bucket.GetObjectToFile(storagePath, filepath); err != nil {
+func (s *aliOSSStorage) DownloadFile(ctx context.Context, filepath, storagePath string) (int64, error) {
+	if err := s.bucket.GetObjectToFile(storagePath, filepath, oss.WithContext(ctx)); err != nil {
 		return 0, wrapAliOSSObjectError(err)
 	}
-
 	info, err := os.Stat(filepath)
 	if err != nil {
 		return 0, err
 	}
-
 	return info.Size(), nil
 }
 
@@ -134,10 +114,6 @@ func (s *aliOSSStorage) presignedUrl(storagePath string, expiration time.Duratio
 		return "", wrapAliOSSError(err)
 	}
 	return u, nil
-}
-
-func (s *aliOSSStorage) DeleteObject(storagePath string) error {
-	return wrapAliOSSError(s.bucket.DeleteObject(storagePath))
 }
 
 func (s *aliOSSStorage) PutObject(ctx context.Context, storagePath string, data []byte, opts PutOptions) error {

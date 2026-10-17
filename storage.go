@@ -17,6 +17,9 @@ package storage
 import (
 	"bytes"
 	"context"
+	"net"
+	"net/http"
+	"time"
 
 	"github.com/livekit/storage/objects"
 )
@@ -39,10 +42,29 @@ func New(conf Config) (Storage, error) {
 }
 
 // getObject is GetObject for a backend whose reads are streams.
-func getObject(ctx context.Context, s Storage, storagePath string) ([]byte, error) {
+func getObject(ctx context.Context, s Bucket, storagePath string) ([]byte, error) {
 	var buf bytes.Buffer
 	if _, err := s.DownloadObject(ctx, storagePath, &buf); err != nil {
 		return nil, err
 	}
 	return buf.Bytes(), nil
+}
+
+// responseHeaderTimeout bounds the wait for a response's headers on the clients
+// this package builds. It catches a dead connection without a deadline on the
+// body, so a long transfer is never cut; a call's context bounds the call.
+const responseHeaderTimeout = time.Minute
+
+// transportWithTimeouts is t, or Go's default transport, with dial, TLS and
+// response header timeouts.
+func transportWithTimeouts(rt http.RoundTripper) *http.Transport {
+	t, ok := rt.(*http.Transport)
+	if !ok {
+		t = http.DefaultTransport.(*http.Transport)
+	}
+	t = t.Clone()
+	t.DialContext = (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext
+	t.TLSHandshakeTimeout = 10 * time.Second
+	t.ResponseHeaderTimeout = responseHeaderTimeout
+	return t
 }

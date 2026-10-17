@@ -16,6 +16,7 @@ package storage
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/base64"
 	"errors"
@@ -128,12 +129,12 @@ func getConf(conf *S3Config, cp aws.CredentialsProvider) (*aws.Config, error) {
 			})
 		}
 
+		s3Transport := transportWithTimeouts(nil)
 		if conf.ProxyConfig != nil {
 			proxyUrl, err := url.Parse(conf.ProxyConfig.Url)
 			if err != nil {
 				return err
 			}
-			s3Transport := http.DefaultTransport.(*http.Transport).Clone()
 			s3Transport.Proxy = http.ProxyURL(proxyUrl)
 			if conf.ProxyConfig.Username != "" && conf.ProxyConfig.Password != "" {
 				auth := fmt.Sprintf("%s:%s", conf.ProxyConfig.Username, conf.ProxyConfig.Password)
@@ -141,8 +142,8 @@ func getConf(conf *S3Config, cp aws.CredentialsProvider) (*aws.Config, error) {
 				s3Transport.ProxyConnectHeader = http.Header{}
 				s3Transport.ProxyConnectHeader.Add("Proxy-Authorization", basicAuth)
 			}
-			o.HTTPClient = &http.Client{Transport: s3Transport}
 		}
+		o.HTTPClient = &http.Client{Transport: s3Transport}
 
 		return nil
 	}
@@ -193,63 +194,37 @@ func (s *s3Storage) getClient(l logging.Logger) *s3.Client {
 	})
 }
 
-func (s *s3Storage) UploadData(data []byte, storagePath, contentType string) (string, int64, error) {
-	location, err := s.upload(bytes.NewReader(data), storagePath, contentType)
-	if err != nil {
+func (s *s3Storage) UploadData(ctx context.Context, data []byte, storagePath, contentType string) (string, int64, error) {
+	if err := s.upload(ctx, bytes.NewReader(data), storagePath, contentType); err != nil {
 		return "", 0, err
 	}
-	return location, int64(len(data)), nil
+	return s.location(storagePath), int64(len(data)), nil
 }
 
-func (s *s3Storage) UploadFile(filepath, storagePath, contentType string) (string, int64, error) {
+func (s *s3Storage) UploadFile(ctx context.Context, filepath, storagePath, contentType string) (string, int64, error) {
 	file, err := os.Open(filepath)
 	if err != nil {
 		return "", 0, err
 	}
-	defer func() {
-		_ = file.Close()
-	}()
+	defer file.Close()
 
 	stat, err := file.Stat()
 	if err != nil {
 		return "", 0, err
 	}
-
-	location, err := s.upload(file, storagePath, contentType)
-	if err != nil {
+	if err = s.upload(ctx, file, storagePath, contentType); err != nil {
 		return "", 0, err
 	}
-
-	return location, stat.Size(), nil
+	return s.location(storagePath), stat.Size(), nil
 }
 
-func (s *s3Storage) upload(reader io.Reader, storagePath, contentType string) (string, error) {
+func (s *s3Storage) upload(ctx context.Context, body io.Reader, storagePath, contentType string) error {
 	l := NewS3Logger()
-	client := s.getClient(l)
-
-	input := &s3.PutObjectInput{
-		Body:        reader,
-		Bucket:      aws.String(s.conf.Bucket),
-		ContentType: aws.String(contentType),
-		Key:         aws.String(storagePath),
-		Metadata:    s.conf.Metadata,
-	}
-	if s.conf.Tagging != "" {
-		input.Tagging = &s.conf.Tagging
-	}
-	if s.conf.ContentDisposition != "" {
-		input.ContentDisposition = &s.conf.ContentDisposition
-	} else {
-		contentDisposition := "inline"
-		input.ContentDisposition = &contentDisposition
-	}
-
-	if _, err := s.uploader(client).Upload(context.Background(), input); err != nil {
+	if _, err := s.uploader(s.getClient(l)).Upload(ctx, s.putInput(storagePath, body, PutOptions{ContentType: contentType})); err != nil {
 		l.WriteLogs()
-		return "", wrapS3Error(err)
+		return wrapS3Error(err)
 	}
-
-	return s.location(storagePath), nil
+	return nil
 }
 
 func (s *s3Storage) uploader(client *s3.Client, opts ...func(*manager.Uploader)) *manager.Uploader {
@@ -300,48 +275,19 @@ func (s *s3Storage) location(storagePath string) string {
 	return loc.String()
 }
 
-func (s *s3Storage) DownloadData(storagePath string) ([]byte, error) {
-	w := &manager.WriteAtBuffer{}
-	_, err := s.download(w, storagePath)
-	if err != nil {
-		return nil, err
-	}
-
-	return w.Bytes(), nil
-}
-
-func (s *s3Storage) DownloadFile(filepath, storagePath string) (int64, error) {
+// DownloadFile fetches ranges in parallel into the file.
+func (s *s3Storage) DownloadFile(ctx context.Context, filepath, storagePath string) (int64, error) {
 	file, err := os.Create(filepath)
 	if err != nil {
 		return 0, err
 	}
 	defer file.Close()
 
-	return s.download(file, storagePath)
-}
-
-func (s *s3Storage) download(w io.WriterAt, storagePath string) (int64, error) {
-	client := s.getClient(nil)
-
-	n, err := manager.NewDownloader(client).Download(
-		context.Background(),
-		w,
-		&s3.GetObjectInput{
-			Bucket: aws.String(s.conf.Bucket),
-			Key:    aws.String(storagePath),
-		},
-	)
-	return n, wrapS3ObjectError(err)
-}
-
-func (s *s3Storage) DeleteObject(storagePath string) error {
-	client := s.getClient(nil)
-
-	_, err := client.DeleteObject(context.Background(), &s3.DeleteObjectInput{
+	n, err := manager.NewDownloader(s.getClient(nil)).Download(ctx, file, &s3.GetObjectInput{
 		Bucket: aws.String(s.conf.Bucket),
 		Key:    aws.String(storagePath),
 	})
-	return wrapS3Error(err)
+	return n, wrapS3ObjectError(err)
 }
 
 const s3UploadPartSize = 16 << 20
@@ -396,14 +342,21 @@ func completeIfAbsent(o *s3.Options) {
 	})
 }
 
+// putInput is every write's request: the content type, and the metadata,
+// tagging and content disposition (inline by default) the config sets.
 func (s *s3Storage) putInput(storagePath string, body io.Reader, opts PutOptions) *s3.PutObjectInput {
 	input := &s3.PutObjectInput{
-		Bucket: aws.String(s.conf.Bucket),
-		Key:    aws.String(storagePath),
-		Body:   body,
+		Bucket:             aws.String(s.conf.Bucket),
+		Key:                aws.String(storagePath),
+		Body:               body,
+		Metadata:           s.conf.Metadata,
+		ContentDisposition: aws.String(cmp.Or(s.conf.ContentDisposition, "inline")),
 	}
 	if opts.ContentType != "" {
 		input.ContentType = aws.String(opts.ContentType)
+	}
+	if s.conf.Tagging != "" {
+		input.Tagging = aws.String(s.conf.Tagging)
 	}
 	return input
 }

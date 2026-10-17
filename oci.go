@@ -33,12 +33,8 @@ import (
 )
 
 type ociStorage struct {
-	conf   *OCIConfig
-	client objectstorage.ObjectStorageClient
-	// ctxClient is client without the SDK's 60s request timeout, which covers
-	// reading a body and would cut a long download; the calls that take a
-	// context use it, and the context bounds them instead.
-	ctxClient objectstorage.ObjectStorageClient
+	conf      *OCIConfig
+	client    objectstorage.ObjectStorageClient
 	namespace string
 	host      string
 }
@@ -60,6 +56,11 @@ func NewOCI(conf *OCIConfig) (Storage, error) {
 	if conf.Endpoint != "" {
 		client.Host = conf.Endpoint
 	}
+	// The SDK's 60s http.Client.Timeout covers reading the body and would cut a
+	// long transfer; a response header timeout catches a dead connection instead.
+	if hc, ok := client.HTTPClient.(*http.Client); ok {
+		client.HTTPClient = &http.Client{Transport: transportWithTimeouts(hc.Transport), CheckRedirect: hc.CheckRedirect, Jar: hc.Jar}
+	}
 
 	// The SDK only prepends a scheme to client.Host on the first request, so
 	// read it before GetNamespace below.
@@ -71,11 +72,6 @@ func NewOCI(conf *OCIConfig) (Storage, error) {
 		client:    client,
 		namespace: conf.Namespace,
 		host:      host,
-	}
-
-	s.ctxClient = client
-	if hc, ok := client.HTTPClient.(*http.Client); ok {
-		s.ctxClient.HTTPClient = &http.Client{Transport: hc.Transport, CheckRedirect: hc.CheckRedirect, Jar: hc.Jar}
 	}
 
 	if s.namespace == "" {
@@ -116,55 +112,28 @@ func newConfigProvider(conf *OCIConfig) (common.ConfigurationProvider, error) {
 	return common.DefaultConfigProvider(), nil
 }
 
-func (s *ociStorage) UploadData(data []byte, storagePath, contentType string) (string, int64, error) {
-	size := int64(len(data))
-	body := common.NewOCIReadSeekCloser(io.NopCloser(bytes.NewReader(data)))
-
-	location, err := s.upload(body, size, storagePath, contentType)
-	if err != nil {
+func (s *ociStorage) UploadData(ctx context.Context, data []byte, storagePath, contentType string) (string, int64, error) {
+	if err := s.PutObject(ctx, storagePath, data, PutOptions{ContentType: contentType}); err != nil {
 		return "", 0, err
 	}
-	return location, size, nil
+	return s.location(storagePath), int64(len(data)), nil
 }
 
-func (s *ociStorage) UploadFile(filepath, storagePath, contentType string) (string, int64, error) {
+func (s *ociStorage) UploadFile(ctx context.Context, filepath, storagePath, contentType string) (string, int64, error) {
 	file, err := os.Open(filepath)
 	if err != nil {
 		return "", 0, err
 	}
-	defer func() {
-		_ = file.Close()
-	}()
+	defer file.Close()
 
 	stat, err := file.Stat()
 	if err != nil {
 		return "", 0, err
 	}
-
-	location, err := s.upload(file, stat.Size(), storagePath, contentType)
-	if err != nil {
+	if err = s.UploadObject(ctx, storagePath, file, PutOptions{ContentType: contentType}); err != nil {
 		return "", 0, err
 	}
-	return location, stat.Size(), nil
-}
-
-// upload takes a seekable body: the SDK re-reads it when it retries.
-func (s *ociStorage) upload(body io.ReadCloser, size int64, storagePath, contentType string) (string, error) {
-	contentDisposition := "inline"
-	_, err := s.client.PutObject(context.Background(), objectstorage.PutObjectRequest{
-		NamespaceName:      &s.namespace,
-		BucketName:         &s.conf.Bucket,
-		ObjectName:         &storagePath,
-		PutObjectBody:      body,
-		ContentLength:      &size,
-		ContentType:        &contentType,
-		ContentDisposition: &contentDisposition,
-	})
-	if err != nil {
-		return "", wrapOCIError(err)
-	}
-
-	return s.location(storagePath), nil
+	return s.location(storagePath), stat.Size(), nil
 }
 
 func (s *ociStorage) location(storagePath string) string {
@@ -175,62 +144,25 @@ func (s *ociStorage) location(storagePath string) string {
 	}).String()
 }
 
-func (s *ociStorage) DownloadData(storagePath string) ([]byte, error) {
-	resp, err := s.download(storagePath)
-	if err != nil {
-		return nil, err
-	}
-	defer func() {
-		_ = resp.Content.Close()
-	}()
-
-	data, err := io.ReadAll(resp.Content)
-	if err != nil {
-		return nil, wrapOCIError(err)
-	}
-	return data, nil
-}
-
-func (s *ociStorage) DownloadFile(filepath, storagePath string) (int64, error) {
+func (s *ociStorage) DownloadFile(ctx context.Context, filepath, storagePath string) (int64, error) {
 	file, err := os.Create(filepath)
 	if err != nil {
 		return 0, err
 	}
 	defer file.Close()
 
-	resp, err := s.download(storagePath)
-	if err != nil {
-		return 0, err
-	}
-	defer func() {
-		_ = resp.Content.Close()
-	}()
-
-	if _, err = io.Copy(file, resp.Content); err != nil {
-		return 0, wrapOCIError(err)
-	}
-
-	return *resp.ContentLength, nil
-}
-
-func (s *ociStorage) download(storagePath string) (objectstorage.GetObjectResponse, error) {
-	resp, err := s.client.GetObject(context.Background(), objectstorage.GetObjectRequest{
-		NamespaceName: &s.namespace,
-		BucketName:    &s.conf.Bucket,
-		ObjectName:    &storagePath,
-	})
-	return resp, wrapOCIObjectError(err)
+	return s.DownloadObject(ctx, storagePath, file)
 }
 
 // GeneratePresignedUrl creates a pre-authenticated request. Unlike an S3
 // presigned URL, a PAR is a durable object: it is listable and revocable, it
 // costs an API call to mint, and it needs PAR_MANAGE on the bucket. Its access
 // URI is returned only here and cannot be read back afterwards.
-func (s *ociStorage) presignedUrl(storagePath string, expiration time.Duration) (string, error) {
+func (s *ociStorage) presignedUrl(ctx context.Context, storagePath string, expiration time.Duration) (string, error) {
 	name := fmt.Sprintf("livekit-storage-%s-%d", storagePath, time.Now().UnixNano())
 	expires := common.SDKTime{Time: time.Now().Add(expiration)}
 
-	resp, err := s.client.CreatePreauthenticatedRequest(context.Background(), objectstorage.CreatePreauthenticatedRequestRequest{
+	resp, err := s.client.CreatePreauthenticatedRequest(ctx, objectstorage.CreatePreauthenticatedRequestRequest{
 		NamespaceName: &s.namespace,
 		BucketName:    &s.conf.Bucket,
 		CreatePreauthenticatedRequestDetails: objectstorage.CreatePreauthenticatedRequestDetails{
@@ -249,15 +181,6 @@ func (s *ociStorage) presignedUrl(storagePath string, expiration time.Duration) 
 		Host:   s.host,
 		Path:   *resp.AccessUri,
 	}).String(), nil
-}
-
-func (s *ociStorage) DeleteObject(storagePath string) error {
-	_, err := s.client.DeleteObject(context.Background(), objectstorage.DeleteObjectRequest{
-		NamespaceName: &s.namespace,
-		BucketName:    &s.conf.Bucket,
-		ObjectName:    &storagePath,
-	})
-	return wrapOCIError(err)
 }
 
 func wrapOCIError(err error) error {
@@ -292,7 +215,7 @@ func (s *ociStorage) PutObject(ctx context.Context, storagePath string, data []b
 	if opts.IfAbsent {
 		req.IfNoneMatch = common.String("*")
 	}
-	_, err := s.ctxClient.PutObject(ctx, req)
+	_, err := s.client.PutObject(ctx, req)
 	return wrapOCIObjectError(err)
 }
 
@@ -316,7 +239,7 @@ func (s *ociStorage) UploadObject(ctx context.Context, storagePath string, body 
 	if opts.ContentType != "" {
 		contentType = &opts.ContentType
 	}
-	created, err := s.ctxClient.CreateMultipartUpload(ctx, objectstorage.CreateMultipartUploadRequest{
+	created, err := s.client.CreateMultipartUpload(ctx, objectstorage.CreateMultipartUploadRequest{
 		NamespaceName: &s.namespace,
 		BucketName:    &s.conf.Bucket,
 		IfNoneMatch:   ifNoneMatch,
@@ -330,7 +253,7 @@ func (s *ociStorage) UploadObject(ctx context.Context, storagePath string, body 
 	}
 
 	if err = s.uploadParts(ctx, storagePath, created.UploadId, body, part, n, ifNoneMatch); err != nil {
-		_, _ = s.ctxClient.AbortMultipartUpload(context.WithoutCancel(ctx), objectstorage.AbortMultipartUploadRequest{
+		_, _ = s.client.AbortMultipartUpload(context.WithoutCancel(ctx), objectstorage.AbortMultipartUploadRequest{
 			NamespaceName: &s.namespace,
 			BucketName:    &s.conf.Bucket,
 			ObjectName:    &storagePath,
@@ -347,7 +270,7 @@ func (s *ociStorage) uploadParts(ctx context.Context, storagePath string, upload
 	var parts []objectstorage.CommitMultipartUploadPartDetails
 	for num := 1; n > 0; num++ {
 		size := int64(n)
-		resp, err := s.ctxClient.UploadPart(ctx, objectstorage.UploadPartRequest{
+		resp, err := s.client.UploadPart(ctx, objectstorage.UploadPartRequest{
 			NamespaceName:  &s.namespace,
 			BucketName:     &s.conf.Bucket,
 			ObjectName:     &storagePath,
@@ -367,7 +290,7 @@ func (s *ociStorage) uploadParts(ctx context.Context, storagePath string, upload
 		}
 	}
 
-	_, err := s.ctxClient.CommitMultipartUpload(ctx, objectstorage.CommitMultipartUploadRequest{
+	_, err := s.client.CommitMultipartUpload(ctx, objectstorage.CommitMultipartUploadRequest{
 		NamespaceName:                &s.namespace,
 		BucketName:                   &s.conf.Bucket,
 		ObjectName:                   &storagePath,
@@ -388,7 +311,7 @@ func (s *ociStorage) GetObjectRange(ctx context.Context, storagePath string, off
 	}
 	var buf bytes.Buffer
 	rng := fmt.Sprintf("bytes=%d-%d", offset, offset+length-1)
-	_, err := s.readTo(ctx, storagePath, &buf, &rng)
+	_, err := s.download(ctx, storagePath, &buf, &rng)
 	var se common.ServiceError
 	if errors.As(err, &se) && se.GetHTTPStatusCode() == http.StatusRequestedRangeNotSatisfiable {
 		return []byte{}, nil
@@ -400,11 +323,11 @@ func (s *ociStorage) GetObjectRange(ctx context.Context, storagePath string, off
 }
 
 func (s *ociStorage) DownloadObject(ctx context.Context, storagePath string, w io.Writer) (int64, error) {
-	return s.readTo(ctx, storagePath, w, nil)
+	return s.download(ctx, storagePath, w, nil)
 }
 
-func (s *ociStorage) readTo(ctx context.Context, storagePath string, w io.Writer, rng *string) (int64, error) {
-	resp, err := s.ctxClient.GetObject(ctx, objectstorage.GetObjectRequest{
+func (s *ociStorage) download(ctx context.Context, storagePath string, w io.Writer, rng *string) (int64, error) {
+	resp, err := s.client.GetObject(ctx, objectstorage.GetObjectRequest{
 		NamespaceName: &s.namespace,
 		BucketName:    &s.conf.Bucket,
 		ObjectName:    &storagePath,
@@ -419,7 +342,7 @@ func (s *ociStorage) readTo(ctx context.Context, storagePath string, w io.Writer
 }
 
 func (s *ociStorage) ObjectExists(ctx context.Context, storagePath string) (bool, error) {
-	_, err := s.ctxClient.HeadObject(ctx, objectstorage.HeadObjectRequest{
+	_, err := s.client.HeadObject(ctx, objectstorage.HeadObjectRequest{
 		NamespaceName: &s.namespace,
 		BucketName:    &s.conf.Bucket,
 		ObjectName:    &storagePath,
@@ -435,7 +358,7 @@ func (s *ociStorage) ListObjects(ctx context.Context, prefix string) ([]string, 
 	var keys []string
 	var start *string
 	for {
-		resp, err := s.ctxClient.ListObjects(ctx, objectstorage.ListObjectsRequest{
+		resp, err := s.client.ListObjects(ctx, objectstorage.ListObjectsRequest{
 			NamespaceName: &s.namespace,
 			BucketName:    &s.conf.Bucket,
 			Prefix:        &prefix,
@@ -456,7 +379,7 @@ func (s *ociStorage) ListObjects(ctx context.Context, prefix string) ([]string, 
 
 func (s *ociStorage) DeleteObjects(ctx context.Context, storagePaths []string) error {
 	for _, p := range storagePaths {
-		_, err := s.ctxClient.DeleteObject(ctx, objectstorage.DeleteObjectRequest{
+		_, err := s.client.DeleteObject(ctx, objectstorage.DeleteObjectRequest{
 			NamespaceName: &s.namespace,
 			BucketName:    &s.conf.Bucket,
 			ObjectName:    &p,
@@ -468,8 +391,8 @@ func (s *ociStorage) DeleteObjects(ctx context.Context, storagePaths []string) e
 	return nil
 }
 
-func (s *ociStorage) GeneratePresignedUrl(_ context.Context, storagePath string, expiration time.Duration) (string, error) {
-	return s.presignedUrl(storagePath, expiration)
+func (s *ociStorage) GeneratePresignedUrl(ctx context.Context, storagePath string, expiration time.Duration) (string, error) {
+	return s.presignedUrl(ctx, storagePath, expiration)
 }
 
 func wrapOCIObjectError(err error) error {

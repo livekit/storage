@@ -22,9 +22,9 @@ import (
 
 	"cloud.google.com/go/storage"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+	"github.com/aliyun/aliyun-oss-go-sdk/oss"
 	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
-	"github.com/aliyun/aliyun-oss-go-sdk/oss"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/api/googleapi"
 )

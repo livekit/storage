@@ -60,17 +60,15 @@ type Bucket interface {
 	GeneratePresignedUrl(ctx context.Context, storagePath string, expiration time.Duration) (string, error)
 }
 
-// Storage is Bucket and the calls that upload and fetch whole files and return
-// their location.
+// Storage is Bucket and the calls that publish and fetch whole files.
 type Storage interface {
 	Bucket
 
-	// UploadData and UploadFile replace any object at storagePath.
-	UploadData(data []byte, storagePath, contentType string) (location string, size int64, err error)
-	UploadFile(filepath, storagePath, contentType string) (location string, size int64, err error)
-	DownloadData(storagePath string) (data []byte, err error)
-	DownloadFile(filepath, storagePath string) (size int64, err error)
-	DeleteObject(storagePath string) error
+	// UploadData and UploadFile replace any object at storagePath and return
+	// its location, a URL to it.
+	UploadData(ctx context.Context, data []byte, storagePath, contentType string) (location string, size int64, err error)
+	UploadFile(ctx context.Context, filepath, storagePath, contentType string) (location string, size int64, err error)
+	DownloadFile(ctx context.Context, filepath, storagePath string) (size int64, err error)
 }
 
 type PutOptions struct {

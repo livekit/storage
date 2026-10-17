@@ -84,19 +84,14 @@ func (s *azureBLOBStorage) location(storagePath string) string {
 	}).String()
 }
 
-func (s *azureBLOBStorage) UploadData(data []byte, storagePath, contentType string) (string, int64, error) {
-	_, err := s.client.UploadBuffer(context.Background(), s.conf.ContainerName, storagePath, data, &azblob.UploadBufferOptions{
-		HTTPHeaders: &blob.HTTPHeaders{BlobContentType: &contentType},
-		BlockSize:   azureBlockSize,
-		Concurrency: azureParallelism,
-	})
-	if err != nil {
-		return "", 0, wrapAzureError(err)
+func (s *azureBLOBStorage) UploadData(ctx context.Context, data []byte, storagePath, contentType string) (string, int64, error) {
+	if err := s.PutObject(ctx, storagePath, data, PutOptions{ContentType: contentType}); err != nil {
+		return "", 0, err
 	}
 	return s.location(storagePath), int64(len(data)), nil
 }
 
-func (s *azureBLOBStorage) UploadFile(filepath, storagePath, contentType string) (string, int64, error) {
+func (s *azureBLOBStorage) UploadFile(ctx context.Context, filepath, storagePath, contentType string) (string, int64, error) {
 	file, err := os.Open(filepath)
 	if err != nil {
 		return "", 0, err
@@ -110,7 +105,7 @@ func (s *azureBLOBStorage) UploadFile(filepath, storagePath, contentType string)
 		return "", 0, err
 	}
 
-	_, err = s.client.UploadFile(context.Background(), s.conf.ContainerName, storagePath, file, &azblob.UploadFileOptions{
+	_, err = s.client.UploadFile(ctx, s.conf.ContainerName, storagePath, file, &azblob.UploadFileOptions{
 		HTTPHeaders: &blob.HTTPHeaders{BlobContentType: &contentType},
 		BlockSize:   azureBlockSize,
 		Concurrency: azureParallelism,
@@ -122,37 +117,14 @@ func (s *azureBLOBStorage) UploadFile(filepath, storagePath, contentType string)
 	return s.location(storagePath), stat.Size(), nil
 }
 
-func (s *azureBLOBStorage) DownloadData(storagePath string) ([]byte, error) {
-	ctx := context.Background()
-	blobClient := s.client.ServiceClient().NewContainerClient(s.conf.ContainerName).NewBlobClient(storagePath)
-
-	props, err := blobClient.GetProperties(ctx, nil)
-	if err != nil {
-		return nil, wrapAzureObjectError(err)
-	}
-	if props.ContentLength == nil {
-		return nil, errors.New("azure: missing content length")
-	}
-
-	buf := make([]byte, *props.ContentLength)
-	_, err = s.client.DownloadBuffer(ctx, s.conf.ContainerName, storagePath, buf, &azblob.DownloadBufferOptions{
-		BlockSize:   azureBlockSize,
-		Concurrency: azureParallelism,
-	})
-	if err != nil {
-		return nil, wrapAzureObjectError(err)
-	}
-	return buf, nil
-}
-
-func (s *azureBLOBStorage) DownloadFile(filepath, storagePath string) (int64, error) {
+func (s *azureBLOBStorage) DownloadFile(ctx context.Context, filepath, storagePath string) (int64, error) {
 	file, err := os.Create(filepath)
 	if err != nil {
 		return 0, err
 	}
 	defer file.Close()
 
-	_, err = s.client.DownloadFile(context.Background(), s.conf.ContainerName, storagePath, file, &azblob.DownloadFileOptions{
+	_, err = s.client.DownloadFile(ctx, s.conf.ContainerName, storagePath, file, &azblob.DownloadFileOptions{
 		BlockSize:   azureBlockSize,
 		Concurrency: azureParallelism,
 	})
@@ -167,7 +139,7 @@ func (s *azureBLOBStorage) DownloadFile(filepath, storagePath string) (int64, er
 	return stat.Size(), nil
 }
 
-func (s *azureBLOBStorage) presignedUrlWithToken(storagePath string, expiration time.Duration) (string, error) {
+func (s *azureBLOBStorage) presignedUrlWithToken(ctx context.Context, storagePath string, expiration time.Duration) (string, error) {
 	if s.conf.TokenCredential == nil {
 		return "", errors.New("OAuth required")
 	}
@@ -180,7 +152,7 @@ func (s *azureBLOBStorage) presignedUrlWithToken(storagePath string, expiration 
 		return "", err
 	}
 
-	udc, err := svcClient.GetUserDelegationCredential(context.Background(), service.KeyInfo{
+	udc, err := svcClient.GetUserDelegationCredential(ctx, service.KeyInfo{
 		Start:  to.Ptr(now.Format(sas.TimeFormat)),
 		Expiry: to.Ptr(exp.Format(sas.TimeFormat)),
 	}, nil)
@@ -207,11 +179,6 @@ func (s *azureBLOBStorage) presignedUrlWithToken(storagePath string, expiration 
 		RawQuery: qp.Encode(),
 	}
 	return loc.String(), nil
-}
-
-func (s *azureBLOBStorage) DeleteObject(storagePath string) error {
-	_, err := s.client.DeleteBlob(context.Background(), s.conf.ContainerName, storagePath, nil)
-	return wrapAzureError(err)
 }
 
 func (s *azureBLOBStorage) PutObject(ctx context.Context, storagePath string, data []byte, opts PutOptions) error {
@@ -320,9 +287,9 @@ func (s *azureBLOBStorage) DeleteObjects(ctx context.Context, storagePaths []str
 
 // GeneratePresignedUrl signs with the account key unless a token credential is
 // set, in which case it signs with a user delegation key as Storage does.
-func (s *azureBLOBStorage) GeneratePresignedUrl(_ context.Context, storagePath string, expiration time.Duration) (string, error) {
+func (s *azureBLOBStorage) GeneratePresignedUrl(ctx context.Context, storagePath string, expiration time.Duration) (string, error) {
 	if s.conf.TokenCredential != nil {
-		return s.presignedUrlWithToken(storagePath, expiration)
+		return s.presignedUrlWithToken(ctx, storagePath, expiration)
 	}
 	b := s.client.ServiceClient().NewContainerClient(s.conf.ContainerName).NewBlobClient(storagePath)
 	u, err := b.GetSASURL(sas.BlobPermissions{Read: true}, time.Now().Add(expiration), nil)
