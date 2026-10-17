@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"net/url"
 	"os"
 	"path"
@@ -36,6 +37,8 @@ type ociStorage struct {
 	client    objectstorage.ObjectStorageClient
 	namespace string
 	host      string
+	// insecure is an http:// Endpoint, such as an emulator's.
+	insecure bool
 }
 
 func NewOCI(conf *OCIConfig) (Storage, error) {
@@ -55,10 +58,16 @@ func NewOCI(conf *OCIConfig) (Storage, error) {
 	if conf.Endpoint != "" {
 		client.Host = conf.Endpoint
 	}
+	// The SDK's 60s http.Client.Timeout covers reading the body and would cut a
+	// long transfer; a response header timeout catches a dead connection instead.
+	if hc, ok := client.HTTPClient.(*http.Client); ok {
+		client.HTTPClient = &http.Client{Transport: transportWithTimeouts(hc.Transport), CheckRedirect: hc.CheckRedirect, Jar: hc.Jar}
+	}
 
 	// The SDK only prepends a scheme to client.Host on the first request, so
 	// read it before GetNamespace below.
 	host := strings.TrimPrefix(client.Host, "https://")
+	insecure := strings.HasPrefix(host, "http://")
 	host = strings.TrimPrefix(host, "http://")
 
 	s := &ociStorage{
@@ -66,6 +75,7 @@ func NewOCI(conf *OCIConfig) (Storage, error) {
 		client:    client,
 		namespace: conf.Namespace,
 		host:      host,
+		insecure:  insecure,
 	}
 
 	if s.namespace == "" {
@@ -106,147 +116,61 @@ func newConfigProvider(conf *OCIConfig) (common.ConfigurationProvider, error) {
 	return common.DefaultConfigProvider(), nil
 }
 
-func (s *ociStorage) UploadData(data []byte, storagePath, contentType string) (string, int64, error) {
-	size := int64(len(data))
-	body := common.NewOCIReadSeekCloser(io.NopCloser(bytes.NewReader(data)))
-
-	location, err := s.upload(body, size, storagePath, contentType)
-	if err != nil {
+func (s *ociStorage) UploadData(ctx context.Context, data []byte, storagePath, contentType string) (string, int64, error) {
+	if err := s.PutObject(ctx, storagePath, data, PutOptions{ContentType: contentType}); err != nil {
 		return "", 0, err
 	}
-	return location, size, nil
+	return s.location(storagePath), int64(len(data)), nil
 }
 
-func (s *ociStorage) UploadFile(filepath, storagePath, contentType string) (string, int64, error) {
+func (s *ociStorage) UploadFile(ctx context.Context, filepath, storagePath, contentType string) (string, int64, error) {
 	file, err := os.Open(filepath)
 	if err != nil {
 		return "", 0, err
 	}
-	defer func() {
-		_ = file.Close()
-	}()
+	defer file.Close()
 
 	stat, err := file.Stat()
 	if err != nil {
 		return "", 0, err
 	}
-
-	location, err := s.upload(file, stat.Size(), storagePath, contentType)
-	if err != nil {
+	if err = s.UploadObject(ctx, storagePath, file, PutOptions{ContentType: contentType}); err != nil {
 		return "", 0, err
 	}
-	return location, stat.Size(), nil
-}
-
-// upload takes a seekable body: the SDK re-reads it when it retries.
-func (s *ociStorage) upload(body io.ReadCloser, size int64, storagePath, contentType string) (string, error) {
-	contentDisposition := "inline"
-	_, err := s.client.PutObject(context.Background(), objectstorage.PutObjectRequest{
-		NamespaceName:      &s.namespace,
-		BucketName:         &s.conf.Bucket,
-		ObjectName:         &storagePath,
-		PutObjectBody:      body,
-		ContentLength:      &size,
-		ContentType:        &contentType,
-		ContentDisposition: &contentDisposition,
-	})
-	if err != nil {
-		return "", wrapOCIError(err)
-	}
-
-	return s.location(storagePath), nil
+	return s.location(storagePath), stat.Size(), nil
 }
 
 func (s *ociStorage) location(storagePath string) string {
-	return (&url.URL{
-		Scheme: "https",
-		Host:   s.host,
-		Path:   path.Join("/n", s.namespace, "b", s.conf.Bucket, "o", storagePath),
-	}).String()
+	return s.url(path.Join("/n", s.namespace, "b", s.conf.Bucket, "o", storagePath))
 }
 
-func (s *ociStorage) ListObjects(prefix string) ([]string, error) {
-	var objects []string
-	var start *string
-
-	for {
-		resp, err := s.client.ListObjects(context.Background(), objectstorage.ListObjectsRequest{
-			NamespaceName: &s.namespace,
-			BucketName:    &s.conf.Bucket,
-			Prefix:        &prefix,
-			Start:         start,
-		})
-		if err != nil {
-			return nil, wrapOCIError(err)
-		}
-
-		for _, obj := range resp.Objects {
-			objects = append(objects, *obj.Name)
-		}
-
-		if resp.NextStartWith == nil {
-			return objects, nil
-		}
-		start = resp.NextStartWith
+func (s *ociStorage) url(p string) string {
+	scheme := "https"
+	if s.insecure {
+		scheme = "http"
 	}
+	return (&url.URL{Scheme: scheme, Host: s.host, Path: p}).String()
 }
 
-func (s *ociStorage) DownloadData(storagePath string) ([]byte, error) {
-	resp, err := s.download(storagePath)
-	if err != nil {
-		return nil, err
-	}
-	defer func() {
-		_ = resp.Content.Close()
-	}()
-
-	data, err := io.ReadAll(resp.Content)
-	if err != nil {
-		return nil, wrapOCIError(err)
-	}
-	return data, nil
-}
-
-func (s *ociStorage) DownloadFile(filepath, storagePath string) (int64, error) {
+func (s *ociStorage) DownloadFile(ctx context.Context, filepath, storagePath string) (int64, error) {
 	file, err := os.Create(filepath)
 	if err != nil {
 		return 0, err
 	}
 	defer file.Close()
 
-	resp, err := s.download(storagePath)
-	if err != nil {
-		return 0, err
-	}
-	defer func() {
-		_ = resp.Content.Close()
-	}()
-
-	if _, err = io.Copy(file, resp.Content); err != nil {
-		return 0, wrapOCIError(err)
-	}
-
-	return *resp.ContentLength, nil
-}
-
-func (s *ociStorage) download(storagePath string) (objectstorage.GetObjectResponse, error) {
-	resp, err := s.client.GetObject(context.Background(), objectstorage.GetObjectRequest{
-		NamespaceName: &s.namespace,
-		BucketName:    &s.conf.Bucket,
-		ObjectName:    &storagePath,
-	})
-	return resp, wrapOCIError(err)
+	return s.DownloadObject(ctx, storagePath, file)
 }
 
 // GeneratePresignedUrl creates a pre-authenticated request. Unlike an S3
 // presigned URL, a PAR is a durable object: it is listable and revocable, it
 // costs an API call to mint, and it needs PAR_MANAGE on the bucket. Its access
 // URI is returned only here and cannot be read back afterwards.
-func (s *ociStorage) GeneratePresignedUrl(storagePath string, expiration time.Duration) (string, error) {
+func (s *ociStorage) presignedUrl(ctx context.Context, storagePath string, expiration time.Duration) (string, error) {
 	name := fmt.Sprintf("livekit-storage-%s-%d", storagePath, time.Now().UnixNano())
 	expires := common.SDKTime{Time: time.Now().Add(expiration)}
 
-	resp, err := s.client.CreatePreauthenticatedRequest(context.Background(), objectstorage.CreatePreauthenticatedRequestRequest{
+	resp, err := s.client.CreatePreauthenticatedRequest(ctx, objectstorage.CreatePreauthenticatedRequestRequest{
 		NamespaceName: &s.namespace,
 		BucketName:    &s.conf.Bucket,
 		CreatePreauthenticatedRequestDetails: objectstorage.CreatePreauthenticatedRequestDetails{
@@ -260,31 +184,7 @@ func (s *ociStorage) GeneratePresignedUrl(storagePath string, expiration time.Du
 		return "", wrapOCIError(err)
 	}
 
-	return (&url.URL{
-		Scheme: "https",
-		Host:   s.host,
-		Path:   *resp.AccessUri,
-	}).String(), nil
-}
-
-func (s *ociStorage) DeleteObject(storagePath string) error {
-	_, err := s.client.DeleteObject(context.Background(), objectstorage.DeleteObjectRequest{
-		NamespaceName: &s.namespace,
-		BucketName:    &s.conf.Bucket,
-		ObjectName:    &storagePath,
-	})
-	return wrapOCIError(err)
-}
-
-// DeleteObjects deletes one at a time — OCI has no bulk equivalent — and stops
-// at the first failure, leaving earlier deletions in place, as gcp.go does.
-func (s *ociStorage) DeleteObjects(storagePaths []string) error {
-	for _, storagePath := range storagePaths {
-		if err := s.DeleteObject(storagePath); err != nil {
-			return err
-		}
-	}
-	return nil
+	return s.url(*resp.AccessUri), nil
 }
 
 func wrapOCIError(err error) error {
@@ -299,4 +199,247 @@ func wrapOCIError(err error) error {
 		}
 	}
 	return err
+}
+
+const ociUploadPartSize = 16 << 20
+
+func (s *ociStorage) PutObject(ctx context.Context, storagePath string, data []byte, opts PutOptions) error {
+	size := int64(len(data))
+	req := objectstorage.PutObjectRequest{
+		NamespaceName: &s.namespace,
+		BucketName:    &s.conf.Bucket,
+		ObjectName:    &storagePath,
+		// Seekable, so the SDK can re-read it when it retries.
+		PutObjectBody: common.NewOCIReadSeekCloser(io.NopCloser(bytes.NewReader(data))),
+		ContentLength: &size,
+	}
+	if opts.ContentType != "" {
+		req.ContentType = &opts.ContentType
+	}
+	if opts.IfAbsent {
+		req.IfNoneMatch = common.String("*")
+	}
+	_, err := s.client.PutObject(ctx, req)
+	return wrapOCIObjectError(err)
+}
+
+// UploadObject sends a body that fits one part with PutObject, otherwise a
+// multipart upload of sequential parts through one buffer. IfAbsent is checked
+// at create and again at commit, so it is atomic here.
+func (s *ociStorage) UploadObject(ctx context.Context, storagePath string, body io.Reader, opts PutOptions) error {
+	// The condition is checked again at create and commit; this check spares a
+	// refused upload its traffic, and refuses it where a store ignores
+	// if-none-match on multipart uploads, as floci-oci does.
+	if opts.IfAbsent {
+		exists, err := s.ObjectExists(ctx, storagePath)
+		if err != nil {
+			return err
+		}
+		if exists {
+			return ErrObjectExists
+		}
+	}
+	part := make([]byte, ociUploadPartSize)
+	n, err := io.ReadFull(body, part)
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return s.PutObject(ctx, storagePath, part[:n], opts)
+	}
+	if err != nil {
+		return err
+	}
+
+	var ifNoneMatch, contentType *string
+	if opts.IfAbsent {
+		ifNoneMatch = common.String("*")
+	}
+	if opts.ContentType != "" {
+		contentType = &opts.ContentType
+	}
+	created, err := s.client.CreateMultipartUpload(ctx, objectstorage.CreateMultipartUploadRequest{
+		NamespaceName: &s.namespace,
+		BucketName:    &s.conf.Bucket,
+		IfNoneMatch:   ifNoneMatch,
+		CreateMultipartUploadDetails: objectstorage.CreateMultipartUploadDetails{
+			Object:      &storagePath,
+			ContentType: contentType,
+		},
+	})
+	if err != nil {
+		return wrapOCIObjectError(err)
+	}
+
+	if err = s.uploadParts(ctx, storagePath, created.UploadId, body, part, n, ifNoneMatch); err != nil {
+		_, _ = s.client.AbortMultipartUpload(context.WithoutCancel(ctx), objectstorage.AbortMultipartUploadRequest{
+			NamespaceName: &s.namespace,
+			BucketName:    &s.conf.Bucket,
+			ObjectName:    &storagePath,
+			UploadId:      created.UploadId,
+		})
+	}
+	return err
+}
+
+// uploadParts sends part[:n], then the rest of body a part at a time, and
+// commits. The condition goes on the commit only: on a part, a retry after a
+// part that landed would read as the object existing.
+func (s *ociStorage) uploadParts(ctx context.Context, storagePath string, uploadID *string, body io.Reader, part []byte, n int, ifNoneMatch *string) error {
+	var parts []objectstorage.CommitMultipartUploadPartDetails
+	for num := 1; n > 0; num++ {
+		size := int64(n)
+		resp, err := s.client.UploadPart(ctx, objectstorage.UploadPartRequest{
+			NamespaceName:  &s.namespace,
+			BucketName:     &s.conf.Bucket,
+			ObjectName:     &storagePath,
+			UploadId:       uploadID,
+			UploadPartNum:  common.Int(num),
+			ContentLength:  &size,
+			UploadPartBody: io.NopCloser(bytes.NewReader(part[:n])),
+		})
+		if err != nil {
+			return wrapOCIObjectError(err)
+		}
+		parts = append(parts, objectstorage.CommitMultipartUploadPartDetails{PartNum: common.Int(num), Etag: resp.ETag})
+
+		n, err = io.ReadFull(body, part)
+		if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+			return err
+		}
+	}
+
+	_, err := s.client.CommitMultipartUpload(ctx, objectstorage.CommitMultipartUploadRequest{
+		NamespaceName:                &s.namespace,
+		BucketName:                   &s.conf.Bucket,
+		ObjectName:                   &storagePath,
+		UploadId:                     uploadID,
+		IfNoneMatch:                  ifNoneMatch,
+		CommitMultipartUploadDetails: objectstorage.CommitMultipartUploadDetails{PartsToCommit: parts},
+	})
+	return wrapOCIObjectError(err)
+}
+
+func (s *ociStorage) GetObject(ctx context.Context, storagePath string) ([]byte, error) {
+	return getObject(ctx, s, storagePath)
+}
+
+func (s *ociStorage) GetObjectRange(ctx context.Context, storagePath string, offset, length int64) ([]byte, error) {
+	if offset < 0 || length <= 0 {
+		return nil, fmt.Errorf("storage: invalid range offset %d length %d", offset, length)
+	}
+	var buf bytes.Buffer
+	rng := fmt.Sprintf("bytes=%d-%d", offset, offset+length-1)
+	_, err := s.download(ctx, storagePath, &buf, &rng)
+	var se common.ServiceError
+	if errors.As(err, &se) && se.GetHTTPStatusCode() == http.StatusRequestedRangeNotSatisfiable {
+		return []byte{}, nil
+	}
+	// A range starting at the end can also come back 400 InvalidParameter, as on
+	// floci-oci; the object's size tells it from a bad request.
+	if errors.As(err, &se) && se.GetHTTPStatusCode() == http.StatusBadRequest {
+		head, headErr := s.client.HeadObject(ctx, objectstorage.HeadObjectRequest{
+			NamespaceName: &s.namespace,
+			BucketName:    &s.conf.Bucket,
+			ObjectName:    &storagePath,
+		})
+		if headErr == nil && head.ContentLength != nil && offset >= *head.ContentLength {
+			return []byte{}, nil
+		}
+	}
+	if err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+func (s *ociStorage) DownloadObject(ctx context.Context, storagePath string, w io.Writer) (int64, error) {
+	return s.download(ctx, storagePath, w, nil)
+}
+
+func (s *ociStorage) download(ctx context.Context, storagePath string, w io.Writer, rng *string) (int64, error) {
+	resp, err := s.client.GetObject(ctx, objectstorage.GetObjectRequest{
+		NamespaceName: &s.namespace,
+		BucketName:    &s.conf.Bucket,
+		ObjectName:    &storagePath,
+		Range:         rng,
+	})
+	if err != nil {
+		return 0, wrapOCIObjectError(err)
+	}
+	defer resp.Content.Close()
+	n, err := io.Copy(w, resp.Content)
+	return n, wrapOCIObjectError(err)
+}
+
+func (s *ociStorage) ObjectExists(ctx context.Context, storagePath string) (bool, error) {
+	_, err := s.client.HeadObject(ctx, objectstorage.HeadObjectRequest{
+		NamespaceName: &s.namespace,
+		BucketName:    &s.conf.Bucket,
+		ObjectName:    &storagePath,
+	})
+	err = wrapOCIObjectError(err)
+	if errors.Is(err, ErrObjectNotFound) {
+		return false, nil
+	}
+	return err == nil, err
+}
+
+func (s *ociStorage) ListObjects(ctx context.Context, prefix string) ([]string, error) {
+	var keys []string
+	var start *string
+	for {
+		resp, err := s.client.ListObjects(ctx, objectstorage.ListObjectsRequest{
+			NamespaceName: &s.namespace,
+			BucketName:    &s.conf.Bucket,
+			Prefix:        &prefix,
+			Start:         start,
+		})
+		if err != nil {
+			return nil, wrapOCIObjectError(err)
+		}
+		for _, obj := range resp.Objects {
+			keys = append(keys, *obj.Name)
+		}
+		if resp.NextStartWith == nil {
+			return keys, nil
+		}
+		start = resp.NextStartWith
+	}
+}
+
+func (s *ociStorage) DeleteObjects(ctx context.Context, storagePaths []string) error {
+	for _, p := range storagePaths {
+		_, err := s.client.DeleteObject(ctx, objectstorage.DeleteObjectRequest{
+			NamespaceName: &s.namespace,
+			BucketName:    &s.conf.Bucket,
+			ObjectName:    &p,
+		})
+		if err = wrapOCIObjectError(err); err != nil && !errors.Is(err, ErrObjectNotFound) {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *ociStorage) GeneratePresignedUrl(ctx context.Context, storagePath string, expiration time.Duration) (string, error) {
+	return s.presignedUrl(ctx, storagePath, expiration)
+}
+
+func wrapOCIObjectError(err error) error {
+	if err == nil {
+		return nil
+	}
+	var se common.ServiceError
+	if errors.As(err, &se) {
+		switch se.GetHTTPStatusCode() {
+		case http.StatusNotFound:
+			// A HEAD has no body, so its code is the SDK's BadErrorResponse.
+			// NotAuthorizedOrNotFound stays an error.
+			switch se.GetCode() {
+			case "ObjectNotFound", "BadErrorResponse":
+				return fmt.Errorf("%w: %w", ErrObjectNotFound, wrapOCIError(err))
+			}
+		case http.StatusPreconditionFailed:
+			return fmt.Errorf("%w: %w", ErrObjectExists, wrapOCIError(err))
+		}
+	}
+	return wrapOCIError(err)
 }

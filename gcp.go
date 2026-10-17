@@ -24,11 +24,13 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strings"
 	"time"
 
 	"cloud.google.com/go/storage"
 	"github.com/googleapis/gax-go/v2"
 	"golang.org/x/oauth2/google"
+	"golang.org/x/oauth2/jwt"
 	"google.golang.org/api/googleapi"
 	"google.golang.org/api/iterator"
 	"google.golang.org/api/option"
@@ -59,6 +61,10 @@ func wrapGCPError(err error) error {
 type gcpStorage struct {
 	conf   *GCPConfig
 	client *storage.Client
+	// signer is CredentialsJSON's service account, which signs URLs: with the
+	// credentials passed as a token source, the SDK finds no signer of its own
+	// off GCE.
+	signer *jwt.Config
 }
 
 func NewGCP(conf *GCPConfig) (Storage, error) {
@@ -72,11 +78,20 @@ func NewGCP(conf *GCPConfig) (Storage, error) {
 		if err != nil {
 			return nil, err
 		}
-		opts = append(opts, option.WithTokenSource(jwtConfig.TokenSource(context.Background())))
+		u.signer = jwtConfig
+		if conf.Endpoint == "" {
+			opts = append(opts, option.WithTokenSource(jwtConfig.TokenSource(context.Background())))
+		}
+	}
+	if conf.Endpoint != "" {
+		opts = append(opts,
+			option.WithEndpoint(strings.TrimSuffix(conf.Endpoint, "/")+"/storage/v1/"),
+			option.WithoutAuthentication(),
+		)
 	}
 
 	defaultTransport := http.DefaultTransport.(*http.Transport)
-	transportClone := defaultTransport.Clone()
+	transportClone := transportWithTimeouts(defaultTransport)
 
 	if conf.ProxyConfig != nil {
 		proxyUrl, err := url.Parse(conf.ProxyConfig.Url)
@@ -103,43 +118,38 @@ func NewGCP(conf *GCPConfig) (Storage, error) {
 	return u, nil
 }
 
-func (s *gcpStorage) UploadData(data []byte, storagePath, contentType string) (string, int64, error) {
-	return s.upload(bytes.NewReader(data), storagePath, contentType)
+func (s *gcpStorage) UploadData(ctx context.Context, data []byte, storagePath, contentType string) (string, int64, error) {
+	if err := s.PutObject(ctx, storagePath, data, PutOptions{ContentType: contentType}); err != nil {
+		return "", 0, err
+	}
+	return s.location(storagePath), int64(len(data)), nil
 }
 
-func (s *gcpStorage) UploadFile(filepath, storagePath, contentType string) (string, int64, error) {
+func (s *gcpStorage) UploadFile(ctx context.Context, filepath, storagePath, contentType string) (string, int64, error) {
 	file, err := os.Open(filepath)
 	if err != nil {
 		return "", 0, err
 	}
 	defer file.Close()
 
-	return s.upload(file, storagePath, contentType)
+	stat, err := file.Stat()
+	if err != nil {
+		return "", 0, err
+	}
+	if err = s.UploadObject(ctx, storagePath, file, PutOptions{ContentType: contentType}); err != nil {
+		return "", 0, err
+	}
+	return s.location(storagePath), stat.Size(), nil
 }
 
-func (s *gcpStorage) upload(reader io.Reader, storagePath, contentType string) (string, int64, error) {
-	wc := s.client.Bucket(s.conf.Bucket).Object(storagePath).Retryer(
-		storage.WithBackoff(gax.Backoff{
-			Initial:    time.Millisecond * 100,
-			Max:        time.Second * 5,
-			Multiplier: 2,
-		}),
-		storage.WithMaxAttempts(5),
-		storage.WithPolicy(storage.RetryAlways),
-	).NewWriter(context.Background())
-	wc.ContentType = contentType
-	wc.ChunkRetryDeadline = 0
-
-	n, err := io.Copy(wc, reader)
+func (s *gcpStorage) DownloadFile(ctx context.Context, filepath, storagePath string) (int64, error) {
+	file, err := os.Create(filepath)
 	if err != nil {
-		return "", 0, wrapGCPError(err)
+		return 0, err
 	}
+	defer file.Close()
 
-	if err = wc.Close(); err != nil {
-		return "", 0, wrapGCPError(err)
-	}
-
-	return s.location(storagePath), n, nil
+	return s.DownloadObject(ctx, storagePath, file)
 }
 
 func (s *gcpStorage) location(storagePath string) string {
@@ -150,96 +160,151 @@ func (s *gcpStorage) location(storagePath string) string {
 	}).String()
 }
 
-func (s *gcpStorage) ListObjects(prefix string) ([]string, error) {
-	it := s.client.Bucket(s.conf.Bucket).Objects(context.Background(), &storage.Query{
-		Prefix: prefix,
-	})
-
-	var objects []string
-	for {
-		attr, err := it.Next()
-		if err != nil {
-			if errors.Is(err, iterator.Done) {
-				return objects, nil
-			}
-			return nil, wrapGCPError(err)
-		}
-		objects = append(objects, attr.Name)
+func (s *gcpStorage) presignedUrl(storagePath string, expiration time.Duration) (string, error) {
+	// V4, which the SDK can address to an http:// emulator, signs for at most 7
+	// days.
+	opts := &storage.SignedURLOptions{
+		Scheme:   storage.SigningSchemeV4,
+		Method:   "GET",
+		Expires:  time.Now().Add(expiration),
+		Insecure: strings.HasPrefix(s.conf.Endpoint, "http://"),
 	}
-}
-
-func (s *gcpStorage) DownloadData(storagePath string) ([]byte, error) {
-	rc, err := s.download(storagePath)
-	if err != nil {
-		return nil, err
+	if s.signer != nil {
+		opts.GoogleAccessID = s.signer.Email
+		opts.PrivateKey = s.signer.PrivateKey
 	}
-	defer rc.Close()
-
-	data, err := io.ReadAll(rc)
-	if err != nil {
-		return nil, wrapGCPError(err)
-	}
-	return data, nil
-}
-
-func (s *gcpStorage) DownloadFile(filepath, storagePath string) (int64, error) {
-	file, err := os.Create(filepath)
-	if err != nil {
-		return 0, err
-	}
-	defer file.Close()
-
-	rc, err := s.download(storagePath)
-	if err != nil {
-		return 0, err
-	}
-
-	_, err = io.Copy(file, rc)
-	_ = rc.Close()
-	if err != nil {
-		return 0, wrapGCPError(err)
-	}
-
-	return rc.Attrs.Size, nil
-}
-
-func (s *gcpStorage) download(storagePath string) (*storage.Reader, error) {
-	r, err := s.client.Bucket(s.conf.Bucket).Object(storagePath).Retryer(
-		storage.WithBackoff(
-			gax.Backoff{
-				Initial:    time.Millisecond * 100,
-				Max:        time.Second * 5,
-				Multiplier: 2,
-			}),
-		storage.WithPolicy(storage.RetryAlways),
-	).NewReader(context.Background())
-	if err != nil {
-		return nil, wrapGCPError(err)
-	}
-	return r, nil
-}
-
-func (s *gcpStorage) GeneratePresignedUrl(storagePath string, expiration time.Duration) (string, error) {
-	u, err := s.client.Bucket(s.conf.Bucket).SignedURL(storagePath, &storage.SignedURLOptions{
-		Method:  "GET",
-		Expires: time.Now().Add(expiration),
-	})
+	u, err := s.client.Bucket(s.conf.Bucket).SignedURL(storagePath, opts)
 	if err != nil {
 		return "", wrapGCPError(err)
 	}
 	return u, nil
 }
 
-func (s *gcpStorage) DeleteObject(storagePath string) error {
-	return wrapGCPError(s.client.Bucket(s.conf.Bucket).Object(storagePath).Delete(context.Background()))
+func (s *gcpStorage) object(storagePath string) *storage.ObjectHandle {
+	return s.client.Bucket(s.conf.Bucket).Object(storagePath)
 }
 
-func (s *gcpStorage) DeleteObjects(storagePaths []string) error {
-	bucket := s.client.Bucket(s.conf.Bucket)
-	for _, path := range storagePaths {
-		if err := bucket.Object(path).Delete(context.Background()); err != nil {
-			return wrapGCPError(err)
+// PutObject sizes the upload buffer to data, so a small put sends one request
+// without a full chunk's allocation.
+func (s *gcpStorage) PutObject(ctx context.Context, storagePath string, data []byte, opts PutOptions) error {
+	return s.write(ctx, storagePath, bytes.NewReader(data), opts, min(len(data)+1, googleapi.DefaultUploadChunkSize))
+}
+
+// UploadObject sends body in resumable chunks; IfAbsent is a precondition on
+// the whole upload, so it is atomic here.
+func (s *gcpStorage) UploadObject(ctx context.Context, storagePath string, body io.Reader, opts PutOptions) error {
+	return s.write(ctx, storagePath, body, opts, googleapi.DefaultUploadChunkSize)
+}
+
+func (s *gcpStorage) write(ctx context.Context, storagePath string, body io.Reader, opts PutOptions, chunkSize int) error {
+	obj := s.object(storagePath)
+	if opts.IfAbsent {
+		// Conditional, so the SDK retries it by default.
+		obj = obj.If(storage.Conditions{DoesNotExist: true})
+	} else {
+		obj = obj.Retryer(
+			storage.WithBackoff(gax.Backoff{Initial: 100 * time.Millisecond, Max: 5 * time.Second, Multiplier: 2}),
+			storage.WithMaxAttempts(5),
+			storage.WithPolicy(storage.RetryAlways),
+		)
+	}
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	w := obj.NewWriter(ctx)
+	w.ContentType = opts.ContentType
+	w.ChunkSize = chunkSize
+	if _, err := io.Copy(w, body); err != nil {
+		// Cancelling aborts the upload; Close would store what was sent.
+		cancel()
+		return s.writeError(err, opts.IfAbsent)
+	}
+	return s.writeError(w.Close(), opts.IfAbsent)
+}
+
+// writeError maps a failed precondition to ErrObjectExists only where IfAbsent
+// set one: GCS answers other refusals with 412 too.
+func (s *gcpStorage) writeError(err error, ifAbsent bool) error {
+	var apiErr *googleapi.Error
+	if ifAbsent && errors.As(err, &apiErr) && apiErr.Code == http.StatusPreconditionFailed {
+		return fmt.Errorf("%w: %w", ErrObjectExists, wrapGCPError(err))
+	}
+	return wrapGCPObjectError(err)
+}
+
+func (s *gcpStorage) GetObject(ctx context.Context, storagePath string) ([]byte, error) {
+	return getObject(ctx, s, storagePath)
+}
+
+func (s *gcpStorage) GetObjectRange(ctx context.Context, storagePath string, offset, length int64) ([]byte, error) {
+	if offset < 0 || length <= 0 {
+		return nil, fmt.Errorf("storage: invalid range offset %d length %d", offset, length)
+	}
+	r, err := s.object(storagePath).NewRangeReader(ctx, offset, length)
+	var apiErr *googleapi.Error
+	if errors.As(err, &apiErr) && apiErr.Code == http.StatusRequestedRangeNotSatisfiable {
+		return []byte{}, nil
+	}
+	if err != nil {
+		return nil, wrapGCPObjectError(err)
+	}
+	defer r.Close()
+	data, err := io.ReadAll(r)
+	return data, wrapGCPObjectError(err)
+}
+
+func (s *gcpStorage) DownloadObject(ctx context.Context, storagePath string, w io.Writer) (int64, error) {
+	r, err := s.object(storagePath).NewReader(ctx)
+	if err != nil {
+		return 0, wrapGCPObjectError(err)
+	}
+	defer r.Close()
+	n, err := io.Copy(w, r)
+	return n, wrapGCPObjectError(err)
+}
+
+func (s *gcpStorage) ObjectExists(ctx context.Context, storagePath string) (bool, error) {
+	_, err := s.object(storagePath).Attrs(ctx)
+	if errors.Is(err, storage.ErrObjectNotExist) {
+		return false, nil
+	}
+	return err == nil, wrapGCPObjectError(err)
+}
+
+func (s *gcpStorage) ListObjects(ctx context.Context, prefix string) ([]string, error) {
+	it := s.client.Bucket(s.conf.Bucket).Objects(ctx, &storage.Query{Prefix: prefix})
+	var keys []string
+	for {
+		attrs, err := it.Next()
+		if errors.Is(err, iterator.Done) {
+			return keys, nil
+		}
+		if err != nil {
+			return nil, wrapGCPObjectError(err)
+		}
+		keys = append(keys, attrs.Name)
+	}
+}
+
+func (s *gcpStorage) DeleteObjects(ctx context.Context, storagePaths []string) error {
+	for _, p := range storagePaths {
+		if err := s.object(p).Delete(ctx); err != nil && !errors.Is(err, storage.ErrObjectNotExist) {
+			return wrapGCPObjectError(err)
 		}
 	}
 	return nil
+}
+
+func (s *gcpStorage) GeneratePresignedUrl(_ context.Context, storagePath string, expiration time.Duration) (string, error) {
+	return s.presignedUrl(storagePath, expiration)
+}
+
+func wrapGCPObjectError(err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, storage.ErrObjectNotExist) {
+		return fmt.Errorf("%w: %w", ErrObjectNotFound, wrapGCPError(err))
+	}
+	return wrapGCPError(err)
 }

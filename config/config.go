@@ -41,6 +41,9 @@ type AzureConfig struct {
 	AccountKey      string                 `yaml:"account_key,omitempty"`  // (env AZURE_STORAGE_KEY)
 	ContainerName   string                 `yaml:"container_name,omitempty"`
 	TokenCredential azcore.TokenCredential `yaml:"-"` // required for presigned url generation
+	// Endpoint replaces the service URL https://<account>.blob.core.windows.net/,
+	// e.g. an emulator's http://localhost:4577/<account>/.
+	Endpoint string `yaml:"endpoint,omitempty"`
 }
 
 func (*AzureConfig) storageConfig() {}
@@ -49,6 +52,9 @@ type GCPConfig struct {
 	CredentialsJSON string       `yaml:"credentials_json,omitempty"` // (env GOOGLE_APPLICATION_CREDENTIALS)
 	Bucket          string       `yaml:"bucket,omitempty"`
 	ProxyConfig     *ProxyConfig `yaml:"proxy_config,omitempty"`
+	// Endpoint points the client at an emulator, e.g. http://localhost:4588.
+	// Requests to it are unauthenticated; CredentialsJSON still signs URLs.
+	Endpoint string `yaml:"endpoint,omitempty"`
 }
 
 func (*GCPConfig) storageConfig() {}
