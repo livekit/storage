@@ -16,6 +16,7 @@ package storage_test
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -50,6 +51,7 @@ func TestAliOSS(t *testing.T) {
 	require.NoError(t, err)
 
 	testStorage(t, s)
+	testObjects(t, s)
 }
 
 func TestAzure(t *testing.T) {
@@ -69,6 +71,7 @@ func TestAzure(t *testing.T) {
 	require.NoError(t, err)
 
 	testStorage(t, s)
+	testObjects(t, s)
 }
 
 func TestGCP(t *testing.T) {
@@ -86,6 +89,7 @@ func TestGCP(t *testing.T) {
 	require.NoError(t, err)
 
 	testStorage(t, s)
+	testObjects(t, s)
 }
 
 func TestLocal(t *testing.T) {
@@ -93,6 +97,7 @@ func TestLocal(t *testing.T) {
 	require.NoError(t, err)
 
 	testStorage(t, s)
+	testObjects(t, s)
 }
 
 func TestOCI(t *testing.T) {
@@ -117,6 +122,7 @@ func TestOCI(t *testing.T) {
 	require.NoError(t, err)
 
 	testStorage(t, s)
+	testObjects(t, s)
 }
 
 func TestOCINative(t *testing.T) {
@@ -145,6 +151,7 @@ func TestOCINative(t *testing.T) {
 	require.NoError(t, err)
 
 	testStorage(t, s)
+	testObjects(t, s)
 }
 
 func TestSupabase(t *testing.T) {
@@ -169,6 +176,7 @@ func TestSupabase(t *testing.T) {
 	require.NoError(t, err)
 
 	testStorage(t, s)
+	testObjects(t, s)
 }
 
 func TestS3(t *testing.T) {
@@ -180,16 +188,21 @@ func TestS3(t *testing.T) {
 		t.Skip("Missing env vars")
 	}
 
+	// S3_ENDPOINT reaches an S3-compatible store instead of AWS.
+	endpoint := os.Getenv("S3_ENDPOINT")
 	s, err := storage.New(&storage.S3Config{
-		AccessKey:    key,
-		Secret:       secret,
-		SessionToken: os.Getenv("AWS_SESSION_TOKEN"),
-		Region:       os.Getenv("AWS_REGION"),
-		Bucket:       bucket,
+		AccessKey:      key,
+		Secret:         secret,
+		SessionToken:   os.Getenv("AWS_SESSION_TOKEN"),
+		Region:         os.Getenv("AWS_REGION"),
+		Endpoint:       endpoint,
+		ForcePathStyle: endpoint != "",
+		Bucket:         bucket,
 	})
 	require.NoError(t, err)
 
 	testStorage(t, s)
+	testObjects(t, s)
 }
 
 func testStorage(t *testing.T, s storage.Storage) {
@@ -206,7 +219,7 @@ func testStorage(t *testing.T, s storage.Storage) {
 
 	// best-effort cleanup so a mid-test failure doesn't leave orphans in the bucket
 	t.Cleanup(func() {
-		_ = s.DeleteObjects([]string{pathData, pathFile, pathBulk1, pathBulk2})
+		_ = s.DeleteObjects(context.Background(), []string{pathData, pathFile, pathBulk1, pathBulk2})
 	})
 
 	t.Run("UploadData", func(t *testing.T) {
@@ -232,7 +245,7 @@ func testStorage(t *testing.T, s storage.Storage) {
 	})
 
 	t.Run("ListObjects", func(t *testing.T) {
-		items, err := s.ListObjects(prefix)
+		items, err := s.ListObjects(context.Background(), prefix)
 		require.NoError(t, err)
 		require.Len(t, items, 2)
 
@@ -262,7 +275,7 @@ func testStorage(t *testing.T, s storage.Storage) {
 	})
 
 	t.Run("GeneratePresignedUrl", func(t *testing.T) {
-		rawURL, err := s.GeneratePresignedUrl(pathData, 5*time.Minute)
+		rawURL, err := s.GeneratePresignedUrl(context.Background(), pathData, 5*time.Minute)
 		if err != nil {
 			// Some configurations (e.g. Azure without OAuth) don't support presigning;
 			// the method exists and reported a clear error, which is the contract.
@@ -293,7 +306,7 @@ func testStorage(t *testing.T, s storage.Storage) {
 	t.Run("DeleteObject", func(t *testing.T) {
 		require.NoError(t, s.DeleteObject(pathData))
 
-		items, err := s.ListObjects(prefix)
+		items, err := s.ListObjects(context.Background(), prefix)
 		require.NoError(t, err)
 		require.Len(t, items, 1)
 		require.True(t, strings.HasSuffix(items[0], pathFile))
@@ -306,9 +319,9 @@ func testStorage(t *testing.T, s storage.Storage) {
 		_, _, err = s.UploadData(bulk2Payload, pathBulk2, "text/plain")
 		require.NoError(t, err)
 
-		require.NoError(t, s.DeleteObjects([]string{pathFile, pathBulk1, pathBulk2}))
+		require.NoError(t, s.DeleteObjects(context.Background(), []string{pathFile, pathBulk1, pathBulk2}))
 
-		items, err := s.ListObjects(prefix)
+		items, err := s.ListObjects(context.Background(), prefix)
 		require.NoError(t, err)
 		require.Empty(t, items)
 	})

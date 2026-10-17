@@ -37,6 +37,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
+	"github.com/aws/smithy-go"
 	"github.com/aws/smithy-go/logging"
 	"github.com/aws/smithy-go/middleware"
 )
@@ -299,29 +300,6 @@ func (s *s3Storage) location(storagePath string) string {
 	return loc.String()
 }
 
-func (s *s3Storage) ListObjects(prefix string) ([]string, error) {
-	client := s.getClient(nil)
-
-	var objects []string
-	paginator := s3.NewListObjectsV2Paginator(client, &s3.ListObjectsV2Input{
-		Bucket: aws.String(s.conf.Bucket),
-		Prefix: aws.String(prefix),
-	})
-
-	for paginator.HasMorePages() {
-		page, err := paginator.NextPage(context.Background())
-		if err != nil {
-			return nil, wrapS3Error(err)
-		}
-
-		for _, obj := range page.Contents {
-			objects = append(objects, *obj.Key)
-		}
-	}
-
-	return objects, nil
-}
-
 func (s *s3Storage) DownloadData(storagePath string) ([]byte, error) {
 	w := &manager.WriteAtBuffer{}
 	_, err := s.download(w, storagePath)
@@ -356,20 +334,6 @@ func (s *s3Storage) download(w io.WriterAt, storagePath string) (int64, error) {
 	return n, wrapS3Error(err)
 }
 
-func (s *s3Storage) GeneratePresignedUrl(storagePath string, expiration time.Duration) (string, error) {
-	client := s.getClient(nil)
-
-	res, err := s3.NewPresignClient(client).PresignGetObject(context.Background(), &s3.GetObjectInput{
-		Bucket: aws.String(s.conf.Bucket),
-		Key:    aws.String(storagePath),
-	}, s3.WithPresignExpires(expiration))
-	if err != nil {
-		return "", wrapS3Error(err)
-	}
-
-	return res.URL, nil
-}
-
 func (s *s3Storage) DeleteObject(storagePath string) error {
 	client := s.getClient(nil)
 
@@ -380,37 +344,195 @@ func (s *s3Storage) DeleteObject(storagePath string) error {
 	return wrapS3Error(err)
 }
 
-func (s *s3Storage) DeleteObjects(storagePaths []string) error {
-	client := s.getClient(nil)
+const s3UploadPartSize = 16 << 20
 
-	for i := 0; i < len(storagePaths); i += 1000 {
-		end := i + 1000
-		if end > len(storagePaths) {
-			end = len(storagePaths)
+func (s *s3Storage) PutObject(ctx context.Context, storagePath string, data []byte, opts PutOptions) error {
+	input := s.putInput(storagePath, bytes.NewReader(data), opts)
+	if opts.IfAbsent {
+		input.IfNoneMatch = aws.String("*")
+	}
+	_, err := s.getClient(nil).PutObject(ctx, input)
+	return wrapS3ObjectError(err)
+}
+
+// UploadObject checks IfAbsent before uploading, which spares a refused upload
+// its traffic, and again when it completes.
+func (s *s3Storage) UploadObject(ctx context.Context, storagePath string, body io.Reader, opts PutOptions) error {
+	if opts.IfAbsent {
+		exists, err := s.ObjectExists(ctx, storagePath)
+		if err != nil {
+			return err
 		}
-
-		objects := make([]types.ObjectIdentifier, 0, end-i)
-		for _, path := range storagePaths[i:end] {
-			objects = append(objects, types.ObjectIdentifier{Key: aws.String(path)})
+		if exists {
+			return ErrObjectExists
 		}
+	}
+	input := s.putInput(storagePath, body, opts)
+	uploader := s.uploader(s.getClient(nil), func(u *manager.Uploader) {
+		u.PartSize = s3UploadPartSize
+		if opts.IfAbsent {
+			// A body that fits one part goes up as this PutObject; a larger one
+			// is completed with the same condition, which the uploader drops.
+			input.IfNoneMatch = aws.String("*")
+			u.ClientOptions = append(u.ClientOptions, completeIfAbsent)
+		}
+	})
+	_, err := uploader.Upload(ctx, input)
+	return wrapS3ObjectError(err)
+}
 
-		deleteInput := &s3.DeleteObjectsInput{
-			Bucket: aws.String(s.conf.Bucket),
-			Delete: &types.Delete{
-				Objects: objects,
-				Quiet:   aws.Bool(true),
+func completeIfAbsent(o *s3.Options) {
+	o.APIOptions = append(o.APIOptions, func(stack *middleware.Stack) error {
+		return stack.Initialize.Add(middleware.InitializeMiddlewareFunc("CompleteIfAbsent",
+			func(ctx context.Context, in middleware.InitializeInput, next middleware.InitializeHandler) (
+				middleware.InitializeOutput, middleware.Metadata, error,
+			) {
+				if v, ok := in.Parameters.(*s3.CompleteMultipartUploadInput); ok {
+					v.IfNoneMatch = aws.String("*")
+				}
+				return next.HandleInitialize(ctx, in)
 			},
+		), middleware.Before)
+	})
+}
+
+func (s *s3Storage) putInput(storagePath string, body io.Reader, opts PutOptions) *s3.PutObjectInput {
+	input := &s3.PutObjectInput{
+		Bucket: aws.String(s.conf.Bucket),
+		Key:    aws.String(storagePath),
+		Body:   body,
+	}
+	if opts.ContentType != "" {
+		input.ContentType = aws.String(opts.ContentType)
+	}
+	return input
+}
+
+func (s *s3Storage) GetObject(ctx context.Context, storagePath string) ([]byte, error) {
+	return getObject(ctx, s, storagePath)
+}
+
+func (s *s3Storage) GetObjectRange(ctx context.Context, storagePath string, offset, length int64) ([]byte, error) {
+	if offset < 0 || length <= 0 {
+		return nil, fmt.Errorf("storage: invalid range offset %d length %d", offset, length)
+	}
+	out, err := s.getClient(nil).GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(s.conf.Bucket),
+		Key:    aws.String(storagePath),
+		Range:  aws.String(fmt.Sprintf("bytes=%d-%d", offset, offset+length-1)),
+	})
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) && apiErr.ErrorCode() == "InvalidRange" {
+		return []byte{}, nil
+	}
+	if err != nil {
+		return nil, wrapS3ObjectError(err)
+	}
+	defer out.Body.Close()
+	return io.ReadAll(io.LimitReader(out.Body, length))
+}
+
+func (s *s3Storage) DownloadObject(ctx context.Context, storagePath string, w io.Writer) (int64, error) {
+	out, err := s.getClient(nil).GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(s.conf.Bucket),
+		Key:    aws.String(storagePath),
+	})
+	if err != nil {
+		return 0, wrapS3ObjectError(err)
+	}
+	defer out.Body.Close()
+	return io.Copy(w, out.Body)
+}
+
+func (s *s3Storage) ObjectExists(ctx context.Context, storagePath string) (bool, error) {
+	_, err := s.getClient(nil).HeadObject(ctx, &s3.HeadObjectInput{
+		Bucket: aws.String(s.conf.Bucket),
+		Key:    aws.String(storagePath),
+	})
+	err = wrapS3ObjectError(err)
+	if errors.Is(err, ErrObjectNotFound) {
+		return false, nil
+	}
+	return err == nil, err
+}
+
+func (s *s3Storage) ListObjects(ctx context.Context, prefix string) ([]string, error) {
+	var keys []string
+	paginator := s3.NewListObjectsV2Paginator(s.getClient(nil), &s3.ListObjectsV2Input{
+		Bucket: aws.String(s.conf.Bucket),
+		Prefix: aws.String(prefix),
+	})
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return nil, wrapS3Error(err)
+		}
+		for _, obj := range page.Contents {
+			keys = append(keys, aws.ToString(obj.Key))
+		}
+	}
+	return keys, nil
+}
+
+// DeleteObjects fails when any key fails, even within a batch S3 accepted.
+func (s *s3Storage) DeleteObjects(ctx context.Context, storagePaths []string) error {
+	client := s.getClient(nil)
+	for i := 0; i < len(storagePaths); i += 1000 {
+		batch := storagePaths[i:min(i+1000, len(storagePaths))]
+		objects := make([]types.ObjectIdentifier, 0, len(batch))
+		for _, p := range batch {
+			objects = append(objects, types.ObjectIdentifier{Key: aws.String(p)})
+		}
+		input := &s3.DeleteObjectsInput{
+			Bucket: aws.String(s.conf.Bucket),
+			Delete: &types.Delete{Objects: objects, Quiet: aws.Bool(true)},
 		}
 		if s.conf.Endpoint != "" {
-			// SHA256 is supported by most S3-compatible backends
-			deleteInput.ChecksumAlgorithm = types.ChecksumAlgorithmSha256
+			input.ChecksumAlgorithm = types.ChecksumAlgorithmSha256
 		}
-
-		_, err := client.DeleteObjects(context.Background(), deleteInput)
+		out, err := client.DeleteObjects(ctx, input)
 		if err != nil {
 			return wrapS3Error(err)
 		}
+		if len(out.Errors) > 0 {
+			e := out.Errors[0]
+			return fmt.Errorf("storage: %d of %d deletes failed, first %s: %s %s",
+				len(out.Errors), len(batch), aws.ToString(e.Key), aws.ToString(e.Code), aws.ToString(e.Message))
+		}
 	}
-
 	return nil
+}
+
+func (s *s3Storage) GeneratePresignedUrl(ctx context.Context, storagePath string, expiration time.Duration) (string, error) {
+	res, err := s3.NewPresignClient(s.getClient(nil)).PresignGetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(s.conf.Bucket),
+		Key:    aws.String(storagePath),
+	}, s3.WithPresignExpires(expiration))
+	if err != nil {
+		return "", wrapS3Error(err)
+	}
+	return res.URL, nil
+}
+
+// wrapS3ObjectError is wrapS3Error with ErrObjectNotFound and ErrObjectExists
+// for the codes S3-compatible stores answer them with.
+func wrapS3ObjectError(err error) error {
+	if err == nil {
+		return nil
+	}
+	var noSuchKey *types.NoSuchKey
+	var notFound *types.NotFound
+	if errors.As(err, &noSuchKey) || errors.As(err, &notFound) {
+		return fmt.Errorf("%w: %w", ErrObjectNotFound, wrapS3Error(err))
+	}
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) {
+		switch apiErr.ErrorCode() {
+		case "NoSuchKey", "NotFound", "404":
+			return fmt.Errorf("%w: %w", ErrObjectNotFound, wrapS3Error(err))
+		case "PreconditionFailed":
+			return fmt.Errorf("%w: %w", ErrObjectExists, wrapS3Error(err))
+		}
+	}
+	return wrapS3Error(err)
 }

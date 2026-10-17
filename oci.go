@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"net/url"
 	"os"
 	"path"
@@ -32,8 +33,12 @@ import (
 )
 
 type ociStorage struct {
-	conf      *OCIConfig
-	client    objectstorage.ObjectStorageClient
+	conf   *OCIConfig
+	client objectstorage.ObjectStorageClient
+	// ctxClient is client without the SDK's 60s request timeout, which covers
+	// reading a body and would cut a long download; the calls that take a
+	// context use it, and the context bounds them instead.
+	ctxClient objectstorage.ObjectStorageClient
 	namespace string
 	host      string
 }
@@ -66,6 +71,11 @@ func NewOCI(conf *OCIConfig) (Storage, error) {
 		client:    client,
 		namespace: conf.Namespace,
 		host:      host,
+	}
+
+	s.ctxClient = client
+	if hc, ok := client.HTTPClient.(*http.Client); ok {
+		s.ctxClient.HTTPClient = &http.Client{Transport: hc.Transport, CheckRedirect: hc.CheckRedirect, Jar: hc.Jar}
 	}
 
 	if s.namespace == "" {
@@ -165,32 +175,6 @@ func (s *ociStorage) location(storagePath string) string {
 	}).String()
 }
 
-func (s *ociStorage) ListObjects(prefix string) ([]string, error) {
-	var objects []string
-	var start *string
-
-	for {
-		resp, err := s.client.ListObjects(context.Background(), objectstorage.ListObjectsRequest{
-			NamespaceName: &s.namespace,
-			BucketName:    &s.conf.Bucket,
-			Prefix:        &prefix,
-			Start:         start,
-		})
-		if err != nil {
-			return nil, wrapOCIError(err)
-		}
-
-		for _, obj := range resp.Objects {
-			objects = append(objects, *obj.Name)
-		}
-
-		if resp.NextStartWith == nil {
-			return objects, nil
-		}
-		start = resp.NextStartWith
-	}
-}
-
 func (s *ociStorage) DownloadData(storagePath string) ([]byte, error) {
 	resp, err := s.download(storagePath)
 	if err != nil {
@@ -242,7 +226,7 @@ func (s *ociStorage) download(storagePath string) (objectstorage.GetObjectRespon
 // presigned URL, a PAR is a durable object: it is listable and revocable, it
 // costs an API call to mint, and it needs PAR_MANAGE on the bucket. Its access
 // URI is returned only here and cannot be read back afterwards.
-func (s *ociStorage) GeneratePresignedUrl(storagePath string, expiration time.Duration) (string, error) {
+func (s *ociStorage) presignedUrl(storagePath string, expiration time.Duration) (string, error) {
 	name := fmt.Sprintf("livekit-storage-%s-%d", storagePath, time.Now().UnixNano())
 	expires := common.SDKTime{Time: time.Now().Add(expiration)}
 
@@ -276,17 +260,6 @@ func (s *ociStorage) DeleteObject(storagePath string) error {
 	return wrapOCIError(err)
 }
 
-// DeleteObjects deletes one at a time — OCI has no bulk equivalent — and stops
-// at the first failure, leaving earlier deletions in place, as gcp.go does.
-func (s *ociStorage) DeleteObjects(storagePaths []string) error {
-	for _, storagePath := range storagePaths {
-		if err := s.DeleteObject(storagePath); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 func wrapOCIError(err error) error {
 	if err == nil {
 		return nil
@@ -299,4 +272,223 @@ func wrapOCIError(err error) error {
 		}
 	}
 	return err
+}
+
+const ociUploadPartSize = 16 << 20
+
+func (s *ociStorage) PutObject(ctx context.Context, storagePath string, data []byte, opts PutOptions) error {
+	size := int64(len(data))
+	req := objectstorage.PutObjectRequest{
+		NamespaceName: &s.namespace,
+		BucketName:    &s.conf.Bucket,
+		ObjectName:    &storagePath,
+		// Seekable, so the SDK can re-read it when it retries.
+		PutObjectBody: common.NewOCIReadSeekCloser(io.NopCloser(bytes.NewReader(data))),
+		ContentLength: &size,
+	}
+	if opts.ContentType != "" {
+		req.ContentType = &opts.ContentType
+	}
+	if opts.IfAbsent {
+		req.IfNoneMatch = common.String("*")
+	}
+	_, err := s.ctxClient.PutObject(ctx, req)
+	return wrapOCIObjectError(err)
+}
+
+// UploadObject sends a body that fits one part with PutObject, otherwise a
+// multipart upload of sequential parts through one buffer. IfAbsent is checked
+// at create and again at commit, so it is atomic here.
+func (s *ociStorage) UploadObject(ctx context.Context, storagePath string, body io.Reader, opts PutOptions) error {
+	part := make([]byte, ociUploadPartSize)
+	n, err := io.ReadFull(body, part)
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return s.PutObject(ctx, storagePath, part[:n], opts)
+	}
+	if err != nil {
+		return err
+	}
+
+	var ifNoneMatch, contentType *string
+	if opts.IfAbsent {
+		ifNoneMatch = common.String("*")
+	}
+	if opts.ContentType != "" {
+		contentType = &opts.ContentType
+	}
+	created, err := s.ctxClient.CreateMultipartUpload(ctx, objectstorage.CreateMultipartUploadRequest{
+		NamespaceName: &s.namespace,
+		BucketName:    &s.conf.Bucket,
+		IfNoneMatch:   ifNoneMatch,
+		CreateMultipartUploadDetails: objectstorage.CreateMultipartUploadDetails{
+			Object:      &storagePath,
+			ContentType: contentType,
+		},
+	})
+	if err != nil {
+		return wrapOCIObjectError(err)
+	}
+
+	if err = s.uploadParts(ctx, storagePath, created.UploadId, body, part, n, ifNoneMatch); err != nil {
+		_, _ = s.ctxClient.AbortMultipartUpload(context.WithoutCancel(ctx), objectstorage.AbortMultipartUploadRequest{
+			NamespaceName: &s.namespace,
+			BucketName:    &s.conf.Bucket,
+			ObjectName:    &storagePath,
+			UploadId:      created.UploadId,
+		})
+	}
+	return err
+}
+
+// uploadParts sends part[:n], then the rest of body a part at a time, and
+// commits. The condition goes on the commit only: on a part, a retry after a
+// part that landed would read as the object existing.
+func (s *ociStorage) uploadParts(ctx context.Context, storagePath string, uploadID *string, body io.Reader, part []byte, n int, ifNoneMatch *string) error {
+	var parts []objectstorage.CommitMultipartUploadPartDetails
+	for num := 1; n > 0; num++ {
+		size := int64(n)
+		resp, err := s.ctxClient.UploadPart(ctx, objectstorage.UploadPartRequest{
+			NamespaceName:  &s.namespace,
+			BucketName:     &s.conf.Bucket,
+			ObjectName:     &storagePath,
+			UploadId:       uploadID,
+			UploadPartNum:  common.Int(num),
+			ContentLength:  &size,
+			UploadPartBody: io.NopCloser(bytes.NewReader(part[:n])),
+		})
+		if err != nil {
+			return wrapOCIObjectError(err)
+		}
+		parts = append(parts, objectstorage.CommitMultipartUploadPartDetails{PartNum: common.Int(num), Etag: resp.ETag})
+
+		n, err = io.ReadFull(body, part)
+		if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+			return err
+		}
+	}
+
+	_, err := s.ctxClient.CommitMultipartUpload(ctx, objectstorage.CommitMultipartUploadRequest{
+		NamespaceName:                &s.namespace,
+		BucketName:                   &s.conf.Bucket,
+		ObjectName:                   &storagePath,
+		UploadId:                     uploadID,
+		IfNoneMatch:                  ifNoneMatch,
+		CommitMultipartUploadDetails: objectstorage.CommitMultipartUploadDetails{PartsToCommit: parts},
+	})
+	return wrapOCIObjectError(err)
+}
+
+func (s *ociStorage) GetObject(ctx context.Context, storagePath string) ([]byte, error) {
+	return getObject(ctx, s, storagePath)
+}
+
+func (s *ociStorage) GetObjectRange(ctx context.Context, storagePath string, offset, length int64) ([]byte, error) {
+	if offset < 0 || length <= 0 {
+		return nil, fmt.Errorf("storage: invalid range offset %d length %d", offset, length)
+	}
+	var buf bytes.Buffer
+	rng := fmt.Sprintf("bytes=%d-%d", offset, offset+length-1)
+	_, err := s.readTo(ctx, storagePath, &buf, &rng)
+	var se common.ServiceError
+	if errors.As(err, &se) && se.GetHTTPStatusCode() == http.StatusRequestedRangeNotSatisfiable {
+		return []byte{}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+func (s *ociStorage) DownloadObject(ctx context.Context, storagePath string, w io.Writer) (int64, error) {
+	return s.readTo(ctx, storagePath, w, nil)
+}
+
+func (s *ociStorage) readTo(ctx context.Context, storagePath string, w io.Writer, rng *string) (int64, error) {
+	resp, err := s.ctxClient.GetObject(ctx, objectstorage.GetObjectRequest{
+		NamespaceName: &s.namespace,
+		BucketName:    &s.conf.Bucket,
+		ObjectName:    &storagePath,
+		Range:         rng,
+	})
+	if err != nil {
+		return 0, wrapOCIObjectError(err)
+	}
+	defer resp.Content.Close()
+	n, err := io.Copy(w, resp.Content)
+	return n, wrapOCIObjectError(err)
+}
+
+func (s *ociStorage) ObjectExists(ctx context.Context, storagePath string) (bool, error) {
+	_, err := s.ctxClient.HeadObject(ctx, objectstorage.HeadObjectRequest{
+		NamespaceName: &s.namespace,
+		BucketName:    &s.conf.Bucket,
+		ObjectName:    &storagePath,
+	})
+	err = wrapOCIObjectError(err)
+	if errors.Is(err, ErrObjectNotFound) {
+		return false, nil
+	}
+	return err == nil, err
+}
+
+func (s *ociStorage) ListObjects(ctx context.Context, prefix string) ([]string, error) {
+	var keys []string
+	var start *string
+	for {
+		resp, err := s.ctxClient.ListObjects(ctx, objectstorage.ListObjectsRequest{
+			NamespaceName: &s.namespace,
+			BucketName:    &s.conf.Bucket,
+			Prefix:        &prefix,
+			Start:         start,
+		})
+		if err != nil {
+			return nil, wrapOCIObjectError(err)
+		}
+		for _, obj := range resp.Objects {
+			keys = append(keys, *obj.Name)
+		}
+		if resp.NextStartWith == nil {
+			return keys, nil
+		}
+		start = resp.NextStartWith
+	}
+}
+
+func (s *ociStorage) DeleteObjects(ctx context.Context, storagePaths []string) error {
+	for _, p := range storagePaths {
+		_, err := s.ctxClient.DeleteObject(ctx, objectstorage.DeleteObjectRequest{
+			NamespaceName: &s.namespace,
+			BucketName:    &s.conf.Bucket,
+			ObjectName:    &p,
+		})
+		if err = wrapOCIObjectError(err); err != nil && !errors.Is(err, ErrObjectNotFound) {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *ociStorage) GeneratePresignedUrl(_ context.Context, storagePath string, expiration time.Duration) (string, error) {
+	return s.presignedUrl(storagePath, expiration)
+}
+
+func wrapOCIObjectError(err error) error {
+	if err == nil {
+		return nil
+	}
+	var se common.ServiceError
+	if errors.As(err, &se) {
+		switch se.GetHTTPStatusCode() {
+		case http.StatusNotFound:
+			// A HEAD has no body, so its code is the SDK's BadErrorResponse.
+			// NotAuthorizedOrNotFound stays an error.
+			switch se.GetCode() {
+			case "ObjectNotFound", "BadErrorResponse":
+				return fmt.Errorf("%w: %w", ErrObjectNotFound, wrapOCIError(err))
+			}
+		case http.StatusPreconditionFailed:
+			return fmt.Errorf("%w: %w", ErrObjectExists, wrapOCIError(err))
+		}
+	}
+	return wrapOCIError(err)
 }

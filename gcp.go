@@ -150,24 +150,6 @@ func (s *gcpStorage) location(storagePath string) string {
 	}).String()
 }
 
-func (s *gcpStorage) ListObjects(prefix string) ([]string, error) {
-	it := s.client.Bucket(s.conf.Bucket).Objects(context.Background(), &storage.Query{
-		Prefix: prefix,
-	})
-
-	var objects []string
-	for {
-		attr, err := it.Next()
-		if err != nil {
-			if errors.Is(err, iterator.Done) {
-				return objects, nil
-			}
-			return nil, wrapGCPError(err)
-		}
-		objects = append(objects, attr.Name)
-	}
-}
-
 func (s *gcpStorage) DownloadData(storagePath string) ([]byte, error) {
 	rc, err := s.download(storagePath)
 	if err != nil {
@@ -219,7 +201,7 @@ func (s *gcpStorage) download(storagePath string) (*storage.Reader, error) {
 	return r, nil
 }
 
-func (s *gcpStorage) GeneratePresignedUrl(storagePath string, expiration time.Duration) (string, error) {
+func (s *gcpStorage) presignedUrl(storagePath string, expiration time.Duration) (string, error) {
 	u, err := s.client.Bucket(s.conf.Bucket).SignedURL(storagePath, &storage.SignedURLOptions{
 		Method:  "GET",
 		Expires: time.Now().Add(expiration),
@@ -234,12 +216,127 @@ func (s *gcpStorage) DeleteObject(storagePath string) error {
 	return wrapGCPError(s.client.Bucket(s.conf.Bucket).Object(storagePath).Delete(context.Background()))
 }
 
-func (s *gcpStorage) DeleteObjects(storagePaths []string) error {
-	bucket := s.client.Bucket(s.conf.Bucket)
-	for _, path := range storagePaths {
-		if err := bucket.Object(path).Delete(context.Background()); err != nil {
-			return wrapGCPError(err)
+func (s *gcpStorage) object(storagePath string) *storage.ObjectHandle {
+	return s.client.Bucket(s.conf.Bucket).Object(storagePath)
+}
+
+// PutObject sizes the upload buffer to data, so a small put sends one request
+// without a full chunk's allocation.
+func (s *gcpStorage) PutObject(ctx context.Context, storagePath string, data []byte, opts PutOptions) error {
+	return s.write(ctx, storagePath, bytes.NewReader(data), opts, min(len(data)+1, googleapi.DefaultUploadChunkSize))
+}
+
+// UploadObject sends body in resumable chunks; IfAbsent is a precondition on
+// the whole upload, so it is atomic here.
+func (s *gcpStorage) UploadObject(ctx context.Context, storagePath string, body io.Reader, opts PutOptions) error {
+	return s.write(ctx, storagePath, body, opts, googleapi.DefaultUploadChunkSize)
+}
+
+func (s *gcpStorage) write(ctx context.Context, storagePath string, body io.Reader, opts PutOptions, chunkSize int) error {
+	obj := s.object(storagePath)
+	if opts.IfAbsent {
+		// Conditional, so the SDK retries it by default.
+		obj = obj.If(storage.Conditions{DoesNotExist: true})
+	} else {
+		obj = obj.Retryer(storage.WithPolicy(storage.RetryAlways))
+	}
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	w := obj.NewWriter(ctx)
+	w.ContentType = opts.ContentType
+	w.ChunkSize = chunkSize
+	if _, err := io.Copy(w, body); err != nil {
+		// Cancelling aborts the upload; Close would store what was sent.
+		cancel()
+		return s.writeError(err, opts.IfAbsent)
+	}
+	return s.writeError(w.Close(), opts.IfAbsent)
+}
+
+// writeError maps a failed precondition to ErrObjectExists only where IfAbsent
+// set one: GCS answers other refusals with 412 too.
+func (s *gcpStorage) writeError(err error, ifAbsent bool) error {
+	var apiErr *googleapi.Error
+	if ifAbsent && errors.As(err, &apiErr) && apiErr.Code == http.StatusPreconditionFailed {
+		return fmt.Errorf("%w: %w", ErrObjectExists, wrapGCPError(err))
+	}
+	return wrapGCPObjectError(err)
+}
+
+func (s *gcpStorage) GetObject(ctx context.Context, storagePath string) ([]byte, error) {
+	return getObject(ctx, s, storagePath)
+}
+
+func (s *gcpStorage) GetObjectRange(ctx context.Context, storagePath string, offset, length int64) ([]byte, error) {
+	if offset < 0 || length <= 0 {
+		return nil, fmt.Errorf("storage: invalid range offset %d length %d", offset, length)
+	}
+	r, err := s.object(storagePath).NewRangeReader(ctx, offset, length)
+	var apiErr *googleapi.Error
+	if errors.As(err, &apiErr) && apiErr.Code == http.StatusRequestedRangeNotSatisfiable {
+		return []byte{}, nil
+	}
+	if err != nil {
+		return nil, wrapGCPObjectError(err)
+	}
+	defer r.Close()
+	data, err := io.ReadAll(r)
+	return data, wrapGCPObjectError(err)
+}
+
+func (s *gcpStorage) DownloadObject(ctx context.Context, storagePath string, w io.Writer) (int64, error) {
+	r, err := s.object(storagePath).NewReader(ctx)
+	if err != nil {
+		return 0, wrapGCPObjectError(err)
+	}
+	defer r.Close()
+	n, err := io.Copy(w, r)
+	return n, wrapGCPObjectError(err)
+}
+
+func (s *gcpStorage) ObjectExists(ctx context.Context, storagePath string) (bool, error) {
+	_, err := s.object(storagePath).Attrs(ctx)
+	if errors.Is(err, storage.ErrObjectNotExist) {
+		return false, nil
+	}
+	return err == nil, wrapGCPObjectError(err)
+}
+
+func (s *gcpStorage) ListObjects(ctx context.Context, prefix string) ([]string, error) {
+	it := s.client.Bucket(s.conf.Bucket).Objects(ctx, &storage.Query{Prefix: prefix})
+	var keys []string
+	for {
+		attrs, err := it.Next()
+		if errors.Is(err, iterator.Done) {
+			return keys, nil
+		}
+		if err != nil {
+			return nil, wrapGCPObjectError(err)
+		}
+		keys = append(keys, attrs.Name)
+	}
+}
+
+func (s *gcpStorage) DeleteObjects(ctx context.Context, storagePaths []string) error {
+	for _, p := range storagePaths {
+		if err := s.object(p).Delete(ctx); err != nil && !errors.Is(err, storage.ErrObjectNotExist) {
+			return wrapGCPObjectError(err)
 		}
 	}
 	return nil
+}
+
+func (s *gcpStorage) GeneratePresignedUrl(_ context.Context, storagePath string, expiration time.Duration) (string, error) {
+	return s.presignedUrl(storagePath, expiration)
+}
+
+func wrapGCPObjectError(err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, storage.ErrObjectNotExist) {
+		return fmt.Errorf("%w: %w", ErrObjectNotFound, wrapGCPError(err))
+	}
+	return wrapGCPError(err)
 }

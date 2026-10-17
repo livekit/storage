@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package objects is the ObjectStorage interface without any provider SDK, for
-// code that implements or consumes it without creating one, the way config
-// holds the config structs.
+// Package objects is the Storage interface without any provider SDK, for code
+// that implements or accepts it without creating one, the way config holds the
+// config structs.
 package objects
 
 import (
@@ -24,12 +24,19 @@ import (
 	"time"
 )
 
-// Storage is for services that keep and manage their own objects, where
-// storage.Storage is for uploading files and handing out their location. Every
-// call takes a context, a write can refuse to replace an object, a read can take
-// a range or stream to any writer, and a missing or existing object comes back
-// as ErrNotFound or ErrExists. storage.Storage stays as it is for its callers.
 type Storage interface {
+	// UploadData and UploadFile replace any object at storagePath and return
+	// its location.
+	UploadData(data []byte, storagePath, contentType string) (location string, size int64, err error)
+	UploadFile(filepath, storagePath, contentType string) (location string, size int64, err error)
+
+	DownloadData(storagePath string) (data []byte, err error)
+	DownloadFile(filepath, storagePath string) (size int64, err error)
+	DeleteObject(storagePath string) error
+
+	// The calls below take a context, and report a missing or existing object as
+	// ErrNotFound or ErrExists.
+
 	PutObject(ctx context.Context, storagePath string, data []byte, opts PutOptions) error
 	// UploadObject streams body in parts: memory is bounded by the part size
 	// times the upload concurrency, whatever the object's size.
@@ -43,7 +50,8 @@ type Storage interface {
 	ObjectExists(ctx context.Context, storagePath string) (bool, error)
 
 	ListObjects(ctx context.Context, prefix string) ([]string, error)
-	// DeleteObjects succeeds for paths that hold nothing.
+	// DeleteObjects succeeds for paths that hold nothing and fails when a path
+	// is not deleted.
 	DeleteObjects(ctx context.Context, storagePaths []string) error
 
 	GeneratePresignedUrl(ctx context.Context, storagePath string, expiration time.Duration) (string, error)

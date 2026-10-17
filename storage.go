@@ -14,23 +14,34 @@
 
 package storage
 
-import "time"
+import (
+	"bytes"
+	"context"
 
-type Storage interface {
-	UploadData(data []byte, storagePath, contentType string) (location string, size int64, err error)
-	UploadFile(filepath, storagePath, contentType string) (location string, size int64, err error)
+	"github.com/livekit/storage/objects"
+)
 
-	ListObjects(prefix string) ([]string, error)
+// The interface lives in storage/objects so that code implementing or
+// accepting it without creating one doesn't pull in every provider SDK.
+type (
+	Storage    = objects.Storage
+	PutOptions = objects.PutOptions
+)
 
-	DownloadData(storagePath string) (data []byte, err error)
-	DownloadFile(filepath, storagePath string) (size int64, err error)
-
-	GeneratePresignedUrl(storagePath string, expiration time.Duration) (url string, err error)
-
-	DeleteObject(storagePath string) error
-	DeleteObjects(storagePaths []string) error
-}
+var (
+	ErrObjectNotFound = objects.ErrNotFound
+	ErrObjectExists   = objects.ErrExists
+)
 
 func New(conf Config) (Storage, error) {
 	return newStorage(conf)
+}
+
+// getObject is GetObject for a backend whose reads are streams.
+func getObject(ctx context.Context, s Storage, storagePath string) ([]byte, error) {
+	var buf bytes.Buffer
+	if _, err := s.DownloadObject(ctx, storagePath, &buf); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
 }

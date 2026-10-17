@@ -15,9 +15,11 @@
 package storage
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"path"
@@ -27,6 +29,7 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blob"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/bloberror"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/sas"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/service"
 )
@@ -119,27 +122,6 @@ func (s *azureBLOBStorage) UploadFile(filepath, storagePath, contentType string)
 	return s.location(storagePath), stat.Size(), nil
 }
 
-func (s *azureBLOBStorage) ListObjects(prefix string) ([]string, error) {
-	var objects []string
-
-	pager := s.client.NewListBlobsFlatPager(s.conf.ContainerName, &azblob.ListBlobsFlatOptions{
-		Prefix: &prefix,
-	})
-	for pager.More() {
-		page, err := pager.NextPage(context.Background())
-		if err != nil {
-			return nil, wrapAzureError(err)
-		}
-		for _, item := range page.Segment.BlobItems {
-			if item.Name != nil {
-				objects = append(objects, *item.Name)
-			}
-		}
-	}
-
-	return objects, nil
-}
-
 func (s *azureBLOBStorage) DownloadData(storagePath string) ([]byte, error) {
 	ctx := context.Background()
 	blobClient := s.client.ServiceClient().NewContainerClient(s.conf.ContainerName).NewBlobClient(storagePath)
@@ -185,7 +167,7 @@ func (s *azureBLOBStorage) DownloadFile(filepath, storagePath string) (int64, er
 	return stat.Size(), nil
 }
 
-func (s *azureBLOBStorage) GeneratePresignedUrl(storagePath string, expiration time.Duration) (string, error) {
+func (s *azureBLOBStorage) presignedUrlWithToken(storagePath string, expiration time.Duration) (string, error) {
 	if s.conf.TokenCredential == nil {
 		return "", errors.New("OAuth required")
 	}
@@ -232,11 +214,129 @@ func (s *azureBLOBStorage) DeleteObject(storagePath string) error {
 	return wrapAzureError(err)
 }
 
-func (s *azureBLOBStorage) DeleteObjects(storagePaths []string) error {
-	for _, p := range storagePaths {
-		if err := s.DeleteObject(p); err != nil {
+func (s *azureBLOBStorage) PutObject(ctx context.Context, storagePath string, data []byte, opts PutOptions) error {
+	return s.UploadObject(ctx, storagePath, bytes.NewReader(data), opts)
+}
+
+// UploadObject stages blocks and commits them; IfAbsent is a condition on the
+// commit, so it is atomic here. The check before staging only spares a refused
+// upload its traffic.
+func (s *azureBLOBStorage) UploadObject(ctx context.Context, storagePath string, body io.Reader, opts PutOptions) error {
+	if opts.IfAbsent {
+		exists, err := s.ObjectExists(ctx, storagePath)
+		if err != nil {
 			return err
+		}
+		if exists {
+			return ErrObjectExists
+		}
+	}
+	uploadOpts := &azblob.UploadStreamOptions{BlockSize: azureBlockSize, Concurrency: azureParallelism}
+	if opts.ContentType != "" {
+		uploadOpts.HTTPHeaders = &blob.HTTPHeaders{BlobContentType: to.Ptr(opts.ContentType)}
+	}
+	if opts.IfAbsent {
+		uploadOpts.AccessConditions = &blob.AccessConditions{
+			ModifiedAccessConditions: &blob.ModifiedAccessConditions{IfNoneMatch: to.Ptr(azcore.ETagAny)},
+		}
+	}
+	_, err := s.client.UploadStream(ctx, s.conf.ContainerName, storagePath, body, uploadOpts)
+	// A racing upload's commit discards this one's staged blocks.
+	if opts.IfAbsent && bloberror.HasCode(err, bloberror.InvalidBlockList) {
+		return fmt.Errorf("%w: %w", ErrObjectExists, wrapAzureError(err))
+	}
+	return wrapAzureObjectError(err)
+}
+
+func (s *azureBLOBStorage) GetObject(ctx context.Context, storagePath string) ([]byte, error) {
+	return getObject(ctx, s, storagePath)
+}
+
+func (s *azureBLOBStorage) GetObjectRange(ctx context.Context, storagePath string, offset, length int64) ([]byte, error) {
+	if offset < 0 || length <= 0 {
+		return nil, fmt.Errorf("storage: invalid range offset %d length %d", offset, length)
+	}
+	var buf bytes.Buffer
+	_, err := s.download(ctx, storagePath, &buf, blob.HTTPRange{Offset: offset, Count: length})
+	if bloberror.HasCode(err, bloberror.InvalidRange) {
+		return []byte{}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+func (s *azureBLOBStorage) DownloadObject(ctx context.Context, storagePath string, w io.Writer) (int64, error) {
+	return s.download(ctx, storagePath, w, blob.HTTPRange{})
+}
+
+func (s *azureBLOBStorage) download(ctx context.Context, storagePath string, w io.Writer, r blob.HTTPRange) (int64, error) {
+	resp, err := s.client.DownloadStream(ctx, s.conf.ContainerName, storagePath, &azblob.DownloadStreamOptions{Range: r})
+	if err != nil {
+		return 0, wrapAzureObjectError(err)
+	}
+	body := resp.NewRetryReader(ctx, &blob.RetryReaderOptions{MaxRetries: 3})
+	defer body.Close()
+	n, err := io.Copy(w, body)
+	return n, wrapAzureObjectError(err)
+}
+
+func (s *azureBLOBStorage) ObjectExists(ctx context.Context, storagePath string) (bool, error) {
+	blobClient := s.client.ServiceClient().NewContainerClient(s.conf.ContainerName).NewBlobClient(storagePath)
+	_, err := blobClient.GetProperties(ctx, nil)
+	if bloberror.HasCode(err, bloberror.BlobNotFound) {
+		return false, nil
+	}
+	return err == nil, wrapAzureObjectError(err)
+}
+
+func (s *azureBLOBStorage) ListObjects(ctx context.Context, prefix string) ([]string, error) {
+	pager := s.client.NewListBlobsFlatPager(s.conf.ContainerName, &azblob.ListBlobsFlatOptions{Prefix: &prefix})
+	var keys []string
+	for pager.More() {
+		page, err := pager.NextPage(ctx)
+		if err != nil {
+			return nil, wrapAzureObjectError(err)
+		}
+		for _, item := range page.Segment.BlobItems {
+			keys = append(keys, *item.Name)
+		}
+	}
+	return keys, nil
+}
+
+func (s *azureBLOBStorage) DeleteObjects(ctx context.Context, storagePaths []string) error {
+	for _, p := range storagePaths {
+		_, err := s.client.DeleteBlob(ctx, s.conf.ContainerName, p, &azblob.DeleteBlobOptions{
+			DeleteSnapshots: to.Ptr(azblob.DeleteSnapshotsOptionTypeInclude),
+		})
+		if err != nil && !bloberror.HasCode(err, bloberror.BlobNotFound) {
+			return wrapAzureObjectError(err)
 		}
 	}
 	return nil
+}
+
+// GeneratePresignedUrl signs with the account key unless a token credential is
+// set, in which case it signs with a user delegation key as Storage does.
+func (s *azureBLOBStorage) GeneratePresignedUrl(_ context.Context, storagePath string, expiration time.Duration) (string, error) {
+	if s.conf.TokenCredential != nil {
+		return s.presignedUrlWithToken(storagePath, expiration)
+	}
+	b := s.client.ServiceClient().NewContainerClient(s.conf.ContainerName).NewBlobClient(storagePath)
+	u, err := b.GetSASURL(sas.BlobPermissions{Read: true}, time.Now().Add(expiration), nil)
+	return u, wrapAzureError(err)
+}
+
+func wrapAzureObjectError(err error) error {
+	switch {
+	case err == nil:
+		return nil
+	case bloberror.HasCode(err, bloberror.BlobNotFound):
+		return fmt.Errorf("%w: %w", ErrObjectNotFound, wrapAzureError(err))
+	case bloberror.HasCode(err, bloberror.BlobAlreadyExists, bloberror.ConditionNotMet):
+		return fmt.Errorf("%w: %w", ErrObjectExists, wrapAzureError(err))
+	}
+	return wrapAzureError(err)
 }
