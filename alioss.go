@@ -263,16 +263,7 @@ const aliOSSAttempts = 3
 func aliOSSRetry(ctx context.Context, call func() error) error {
 	var err error
 	for attempt := range aliOSSAttempts {
-		if err = call(); err == nil || ctx.Err() != nil {
-			return err
-		}
-		var svcErr oss.ServiceError
-		var netErr net.Error
-		retryable := errors.As(err, &netErr) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, syscall.ECONNRESET)
-		if errors.As(err, &svcErr) {
-			retryable = svcErr.StatusCode >= 500 || svcErr.StatusCode == http.StatusTooManyRequests
-		}
-		if !retryable {
+		if err = call(); err == nil || ctx.Err() != nil || !aliOSSRetryable(err) {
 			return err
 		}
 		backoff := 200 * time.Millisecond << attempt
@@ -283,6 +274,18 @@ func aliOSSRetry(ctx context.Context, call func() error) error {
 		}
 	}
 	return err
+}
+
+// aliOSSRetryable is a failure another attempt can get past: OSS throttling or
+// a 5xx, or a connection that broke. A 4xx, as for a denied or bad request,
+// would fail again.
+func aliOSSRetryable(err error) bool {
+	var svcErr oss.ServiceError
+	if errors.As(err, &svcErr) {
+		return svcErr.StatusCode >= 500 || svcErr.StatusCode == http.StatusTooManyRequests
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, syscall.ECONNRESET)
 }
 
 func wrapAliOSSObjectError(err error) error {
