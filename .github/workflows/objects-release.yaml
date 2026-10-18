@@ -1,0 +1,29 @@
+name: objects release
+
+permissions:
+  contents: write
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  # Tags the objects version go.mod requires on this commit, so main never
+  # requires one that does not exist. An existing tag is left as it is: the
+  # test workflow kept objects/ from changing under it.
+  tag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Tag objects
+        run: |
+          tag="objects/$(awk '$1 == "github.com/livekit/storage/objects" {print $2}' go.mod)"
+          if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+            git diff --quiet "refs/tags/$tag" HEAD -- objects || { echo "::error::objects/ differs from $tag"; exit 1; }
+            exit 0
+          fi
+          git tag "$tag" HEAD
+          git push origin "$tag"

@@ -159,8 +159,6 @@ github.com/livekit/protocol v1.52.1 h1:w8wRjRlj/57AJBxwomEzpEMzf+lT0qOoLQLO7awdT
 github.com/livekit/protocol v1.52.1/go.mod h1:t5CV/LCsWbI9zsSTHTJKDyLtByqvvVkioSP7jgqpIGA=
 github.com/livekit/psrpc v0.8.0 h1:uo3x+DL8pK2OIaCxg/s9sLUO2cIocS5HwdPhhI+m+fQ=
 github.com/livekit/psrpc v0.8.0/go.mod h1:6KnU8vULoizX0Er9NNfeKJDV8ug87j3fuo19M0bhj6Q=
-github.com/livekit/storage/objects v0.0.0-20261018042631-42ef441ca5be h1:QchdOj9qHifeU69Mb/1+iPrItoaxYZX262eIDrw3osA=
-github.com/livekit/storage/objects v0.0.0-20261018042631-42ef441ca5be/go.mod h1:S3+jo6fCZ+A7Z9N6VGTQoffHRGZyNBHn/Jlb/06pXuM=
 github.com/oracle/oci-go-sdk/v65 v65.126.1 h1:WmQ2Igq7/L/cHlR2jZnJkBC2UI51Ams4DJZW3CZGVBo=
 github.com/oracle/oci-go-sdk/v65 v65.126.1/go.mod h1:YmvgbsnUfrsiJ410XAGQ1BRsrUYJJ7W3O5wUikmeI8w=
 github.com/pierrec/lz4/v4 v4.1.28 h1:pPEPwRJ4kybBTfGt28q7lQsRJQHhC08axprdLD5Ppio=

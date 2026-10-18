@@ -15,6 +15,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # the objects/ tags
       # setup-go caches the module and build caches, keyed on both modules.
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
@@ -30,11 +32,21 @@ jobs:
       - name: Download Go modules
         run: go mod download && (cd e2e && go mod download)
 
-      # The root module builds against the objects version it requires, which
-      # must be the interfaces in this tree: a change to objects/ needs the
-      # requirement bumped to the commit that made it.
-      - name: objects requirement matches objects/
-        run: diff -r --exclude=go.sum --exclude=LICENSE "$(go list -m -f '{{.Dir}}' github.com/livekit/storage/objects)" objects
+      # objects/ is released by tag: objects-release.yaml tags the version
+      # go.mod requires on main after the merge, and go.work builds this tree
+      # against objects/ until then. A tag never moves, so once it exists, a
+      # change to objects/ needs the next version.
+      - name: objects version names these interfaces
+        run: |
+          v=$(awk '$1 == "github.com/livekit/storage/objects" {print $2}' go.mod)
+          if ! [[ "$v" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::go.mod requires github.com/livekit/storage/objects at $v: name a release, such as v0.2.0"
+            exit 1
+          fi
+          if git rev-parse -q --verify "refs/tags/objects/$v" >/dev/null && ! git diff --quiet "refs/tags/objects/$v" HEAD -- objects; then
+            echo "::error::objects/ changed since objects/$v: raise github.com/livekit/storage/objects in go.mod to the next version"
+            exit 1
+          fi
 
       - name: Lint
         uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
