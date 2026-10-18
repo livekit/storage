@@ -44,7 +44,11 @@ jobs:
             exit 1
           fi
           if git rev-parse -q --verify "refs/tags/objects/$v" >/dev/null && ! git diff --quiet "refs/tags/objects/$v" HEAD -- objects; then
-            echo "::error::objects/ changed since objects/$v: raise github.com/livekit/storage/objects in go.mod to the next version"
+            # The next minor after the latest release: before v1, any change
+            # may break a caller.
+            latest=$(git tag -l 'objects/v*' --sort=-v:refname | head -1)
+            next=$(echo "${latest#objects/}" | awk -F. '{print $1 "." $2+1 ".0"}')
+            echo "::error::objects/ changed since objects/$v. Run: go mod edit -require=github.com/livekit/storage/objects@$next"
             exit 1
           fi
 
