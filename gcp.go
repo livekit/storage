@@ -315,7 +315,6 @@ func wrapGCPObjectError(err error) error {
 	return wrapGCPError(err)
 }
 
-// gcsTransportMu serializes newGCSClient's swap of http.DefaultTransport.
 // newGCSClient builds a client that sends through t, with the SDK's auth
 // added on top. The SDK chooses a client certificate and the mTLS endpoint only
 // on a transport of its own, so where GOOGLE_API_USE_CLIENT_CERTIFICATE asks

@@ -96,19 +96,10 @@ func (s *aliOSSStorage) location(storagePath string) string {
 	return u.String()
 }
 
-// DownloadFile has the SDK write a temporary file and rename it, as
-// downloadFile does for the other stores.
 func (s *aliOSSStorage) DownloadFile(ctx context.Context, storagePath, filepath string) (int64, error) {
-	if err := aliOSSRetry(ctx, func() error {
-		return s.bucket.GetObjectToFile(storagePath, filepath, oss.WithContext(ctx))
-	}); err != nil {
-		return 0, wrapAliOSSObjectError(err)
-	}
-	info, err := os.Stat(filepath)
-	if err != nil {
-		return 0, err
-	}
-	return info.Size(), nil
+	return downloadFile(filepath, func(f *os.File) (int64, error) {
+		return s.download(ctx, storagePath, f)
+	})
 }
 
 func (s *aliOSSStorage) presignedURL(storagePath string, expiration time.Duration) (string, error) {
@@ -174,18 +165,27 @@ func (s *aliOSSStorage) DownloadObject(ctx context.Context, storagePath string, 
 	return s.download(ctx, storagePath, w)
 }
 
+// download copies the object to w and, for a whole object, checks the CRC64
+// OSS sends against what arrived, as the SDK's GetObjectToFile does.
 func (s *aliOSSStorage) download(ctx context.Context, storagePath string, w io.Writer, options ...oss.Option) (int64, error) {
-	var r io.ReadCloser
+	var result *oss.GetObjectResult
 	err := aliOSSRetry(ctx, func() (err error) {
-		r, err = s.bucket.GetObject(storagePath, append(options, oss.WithContext(ctx))...)
+		result, err = s.bucket.DoGetObject(&oss.GetObjectRequest{ObjectKey: storagePath}, append(options, oss.WithContext(ctx)))
 		return err
 	})
 	if err != nil {
 		return 0, wrapAliOSSObjectError(err)
 	}
-	defer r.Close()
-	n, err := io.Copy(w, r)
-	return n, wrapAliOSSObjectError(err)
+	defer result.Response.Close()
+	n, err := io.Copy(w, result.Response.Body)
+	if err != nil {
+		return n, wrapAliOSSObjectError(err)
+	}
+	if result.ClientCRC != nil {
+		result.Response.ClientCRC = result.ClientCRC.Sum64()
+		err = oss.CheckCRC(result.Response, "GetObject")
+	}
+	return n, err
 }
 
 func (s *aliOSSStorage) ObjectExists(ctx context.Context, storagePath string) (bool, error) {

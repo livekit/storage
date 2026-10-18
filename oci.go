@@ -157,10 +157,6 @@ func newConfigProvider(conf *OCIConfig) (common.ConfigurationProvider, error) {
 }
 
 // UploadFile sends the file in one PutObject, up to OCI's 50 GiB, which the SDK
-// can retry by seeking it: a multipart upload would need more permissions and
-// can leave uncommitted parts behind.
-
-// UploadFile sends the file in one PutObject, up to OCI's 50 GiB, which the SDK
 // can retry by seeking it, as on main: a multipart upload, which OCI advises
 // past 100 MiB, needs more permissions and can leave uncommitted parts behind.
 func (s *ociStorage) UploadFile(ctx context.Context, storagePath, filepath string, opts PutOptions) (string, int64, error) {

@@ -26,6 +26,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
+	"hash/crc64"
 	"io"
 	"math/big"
 	"net/http"
@@ -33,6 +34,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -396,6 +398,57 @@ func TestAliOSSRetries(t *testing.T) {
 	var status *objects.ErrorWithStatusCode
 	require.ErrorAs(t, err, &status)
 	require.Equal(t, http.StatusForbidden, status.StatusCode)
+}
+
+// AliOSS's DownloadFile keeps the contract: it makes the destination's
+// directory, a body cut short or a CRC64 that does not match leaves the
+// destination as it was and no temporary file behind.
+func TestAliOSSDownloadFile(t *testing.T) {
+	var mode atomic.Value
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body := []byte("hello")
+		crc := crc64.Checksum(body, crc64.MakeTable(crc64.ECMA))
+		switch mode.Load() {
+		case "short":
+			w.Header().Set("Content-Length", "10")
+			_, _ = w.Write(body)
+			// Ends the response five bytes short.
+			conn, _, _ := w.(http.Hijacker).Hijack()
+			_ = conn.Close()
+			return
+		case "bad crc":
+			crc++
+		}
+		w.Header().Set("X-Oss-Hash-Crc64ecma", strconv.FormatUint(crc, 10))
+		_, _ = w.Write(body)
+	}))
+	t.Cleanup(srv.Close)
+	s, err := storage.New(&storage.AliOSSConfig{AccessKey: "key", Secret: "secret", Endpoint: srv.URL, Bucket: "bucket"})
+	require.NoError(t, err)
+	ctx := context.Background()
+
+	dir := t.TempDir()
+	dst := filepath.Join(dir, "new", "dir", "file")
+	mode.Store("ok")
+	n, err := s.DownloadFile(ctx, "k", dst)
+	require.NoError(t, err)
+	require.EqualValues(t, 5, n)
+	got, err := os.ReadFile(dst)
+	require.NoError(t, err)
+	require.Equal(t, []byte("hello"), got)
+
+	for _, m := range []string{"short", "bad crc"} {
+		mode.Store(m)
+		require.NoError(t, os.WriteFile(dst, []byte("kept"), 0o600))
+		_, err = s.DownloadFile(ctx, "k", dst)
+		require.Error(t, err, m)
+		got, err := os.ReadFile(dst)
+		require.NoError(t, err)
+		require.Equal(t, []byte("kept"), got, m)
+		entries, err := os.ReadDir(filepath.Dir(dst))
+		require.NoError(t, err)
+		require.Len(t, entries, 1, "%s left a temporary file", m)
+	}
 }
 
 func selfSignedCert(t *testing.T) []byte {
