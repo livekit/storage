@@ -16,6 +16,7 @@ require (
 	github.com/aws/smithy-go v1.28.1
 	github.com/googleapis/gax-go/v2 v2.26.2
 	github.com/livekit/protocol v1.52.1
+	github.com/livekit/storage/objects v0.1.0
 	github.com/oracle/oci-go-sdk/v65 v65.126.1
 	github.com/stretchr/testify v1.12.1
 	golang.org/x/net v0.59.0
@@ -66,7 +67,6 @@ require (
 	github.com/googleapis/enterprise-certificate-proxy v0.3.22 // indirect
 	github.com/klauspost/compress v1.19.2 // indirect
 	github.com/klauspost/cpuid/v2 v2.4.0 // indirect
-	github.com/livekit/storage/objects v0.1.0
 	github.com/pierrec/lz4/v4 v4.1.28 // indirect
 	github.com/planetscale/vtprotobuf v0.6.1-0.20250313105119-ba97887b0a25 // indirect
 	github.com/puzpuzpuz/xsync/v4 v4.5.0 // indirect

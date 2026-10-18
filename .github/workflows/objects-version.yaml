@@ -1,26 +1,38 @@
 name: objects version
 
 permissions:
-  contents: write
-  actions: write
+  contents: read
 
 on:
   pull_request:
     paths: ["objects/**"]
 
+concurrency:
+  group: objects-version-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
 jobs:
   # Raises the objects version go.mod requires when a PR changes objects/
   # under one already released, so whoever changes the interfaces does
-  # nothing more. A fork's branch cannot be pushed to: there, the test
-  # workflow's check prints the command instead.
+  # nothing more. It pushes with the LiveKit writer app's token: a push with
+  # GITHUB_TOKEN would leave the PR's checks waiting for approval. A fork's
+  # branch cannot be pushed to: there, the test workflow's check prints the
+  # command instead.
   bump:
     if: github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     steps:
+      - id: app
+        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1.12.0
+        with:
+          app-id: ${{ vars.REPO_WRITER_GH_APP_ID }}
+          private-key: ${{ secrets.REPO_WRITER_GH_APP_PRIVATE_KEY }}
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.head_ref }}
           fetch-depth: 0
+          token: ${{ steps.app.outputs.token }}
 
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
@@ -30,8 +42,9 @@ jobs:
 
       - name: Raise the objects version
         env:
-          GH_TOKEN: ${{ github.token }}
           BRANCH: ${{ github.head_ref }}
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          APP: ${{ steps.app.outputs.app-slug }}
         run: |
           v=$(awk '$1 == "github.com/livekit/storage/objects" {print $2}' go.mod)
           # A version not yet released, or released with these interfaces, stands.
@@ -44,10 +57,8 @@ jobs:
           next=$(echo "${latest#objects/}" | awk -F. '{print $1 "." $2+1 ".0"}')
           go mod edit -require=github.com/livekit/storage/objects@$next
           (cd e2e && go mod edit -require=github.com/livekit/storage/objects@$next)
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # The app's own identity, so the commit is attributed to it.
+          git config user.name "$APP[bot]"
+          git config user.email "$(gh api "/users/$APP%5Bbot%5D" --jq .id)+$APP[bot]@users.noreply.github.com"
           git commit -am "objects: $next"
           git push origin "HEAD:$BRANCH"
-          # A push with this token starts no workflow, so the checks for the
-          # new head are started here.
-          gh workflow run test.yaml --ref "$BRANCH"

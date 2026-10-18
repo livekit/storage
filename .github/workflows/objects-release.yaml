@@ -6,6 +6,13 @@ permissions:
 on:
   push:
     branches: [main]
+  # A failed run is retried by hand; GitHub emails the failure to whoever
+  # merged.
+  workflow_dispatch:
+
+concurrency:
+  group: objects-release
+  cancel-in-progress: false
 
 jobs:
   # Tags the objects version go.mod requires on this commit, so main never

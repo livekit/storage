@@ -33,8 +33,10 @@ Why `objects` is its own module:
 How its versions work:
 
 - `go.mod` names the `objects` version the root requires; `go.work` builds the repo against `objects/` in the tree.
-- A PR that changes `objects/` under a released version gets the next minor version committed to it by `objects-version.yaml`. From a fork, CI fails and prints the command.
-- On merge, `objects-release.yaml` tags `objects/vX.Y.Z` on main. Squash merges drop a branch's commits, so only a version tagged on main stays resolvable.
+- A PR that changes `objects/` under a released version gets the next minor version committed to it by `objects-version.yaml`; pull that commit before pushing again. From a fork, CI fails and prints the command.
+- Until the version is tagged, `go mod tidy` in the root fails on it (unknown revision); `go.work` builds the repo meanwhile.
+- On merge, `objects-release.yaml` tags `objects/vX.Y.Z` on main; a failed run can be rerun by hand. Squash merges drop a branch's commits, so only a version tagged on main is sure to stay resolvable.
+- `test` must be a required check on main with branches up to date: two PRs bumped to the same version cannot both merge then.
 
 ## Tests
 
