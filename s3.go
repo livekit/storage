@@ -508,11 +508,12 @@ func (s *s3Storage) DeleteObjects(ctx context.Context, storagePaths []string) er
 			}
 			continue
 		}
-		// S3 answers 200 and lists the keys it could not delete. NoSuchKey is
-		// a key already gone; any other is still there.
+		// S3 answers 200 and lists the keys it could not delete, each with a
+		// code but no status, kept as the API error its other calls return.
+		// NoSuchKey is a key already gone; any other is still there.
 		for _, e := range out.Errors {
 			if aws.ToString(e.Code) != "NoSuchKey" {
-				failed[aws.ToString(e.Key)] = fmt.Errorf("%s: %s", aws.ToString(e.Code), aws.ToString(e.Message))
+				failed[aws.ToString(e.Key)] = &smithy.GenericAPIError{Code: aws.ToString(e.Code), Message: aws.ToString(e.Message)}
 			}
 		}
 	}

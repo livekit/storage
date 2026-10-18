@@ -39,6 +39,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aws/smithy-go"
 	"github.com/stretchr/testify/require"
 
 	"github.com/livekit/storage"
@@ -243,7 +244,9 @@ func TestS3DeleteObjectsKeyErrors(t *testing.T) {
 			var failed *storage.DeleteError
 			require.ErrorAs(t, err, &failed)
 			require.Len(t, failed.Failed, 1)
-			require.ErrorContains(t, failed.Failed["b"], tc.code)
+			var apiErr smithy.APIError
+			require.ErrorAs(t, failed.Failed["b"], &apiErr)
+			require.Equal(t, tc.code, apiErr.ErrorCode())
 		})
 	}
 }
