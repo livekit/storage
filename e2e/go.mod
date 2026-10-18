@@ -79,7 +79,7 @@ require (
 	github.com/klauspost/compress v1.19.2 // indirect
 	github.com/klauspost/cpuid/v2 v2.4.0 // indirect
 	github.com/livekit/protocol v1.52.1 // indirect
-	github.com/livekit/storage/objects v0.0.0-00010101000000-000000000000 // indirect
+	github.com/livekit/storage/objects v0.0.0-20261018042631-42ef441ca5be // indirect
 	github.com/moby/docker-image-spec v1.3.1 // indirect
 	github.com/moby/sys/user v0.3.0 // indirect
 	github.com/moby/term v0.5.0 // indirect

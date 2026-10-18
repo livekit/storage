@@ -6,7 +6,7 @@ Object storage on S3 and S3-compatible stores, GCS, Azure Blob, OCI Object Stora
 - `Storage` is `Bucket` plus `UploadFile` and `DownloadFile`. `DownloadFile` replaces the local file only once the whole object is read.
 - `PutOptions{ContentType, IfAbsent}` on every write. `IfAbsent` refuses to replace an object, atomically where the store honors the condition.
 - Errors: a missing object is `ErrNotFound`, a write `IfAbsent` refuses is `ErrExists` (`errors.Is`); `ErrorWithStatusCode` carries the store's HTTP status and `DeleteError` the paths a delete left (`errors.As`).
-- `storage/objects` imports no provider SDK, so a fake or a library can implement or accept the interfaces without pulling in every SDK.
+- `storage/objects` is a module of its own with no requirements, so a fake or a library can implement or accept the interfaces without inheriting any SDK or its versions. A change to it is two commits: `objects/` first, then this module's requirement bumped to that commit (CI checks they match).
 
 ## Behavior
 

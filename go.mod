@@ -66,7 +66,7 @@ require (
 	github.com/googleapis/enterprise-certificate-proxy v0.3.22 // indirect
 	github.com/klauspost/compress v1.19.2 // indirect
 	github.com/klauspost/cpuid/v2 v2.4.0 // indirect
-	github.com/livekit/storage/objects v0.0.0-00010101000000-000000000000
+	github.com/livekit/storage/objects v0.0.0-20261018042631-42ef441ca5be
 	github.com/pierrec/lz4/v4 v4.1.28 // indirect
 	github.com/planetscale/vtprotobuf v0.6.1-0.20250313105119-ba97887b0a25 // indirect
 	github.com/puzpuzpuz/xsync/v4 v4.5.0 // indirect
@@ -99,5 +99,3 @@ require (
 	google.golang.org/grpc v1.84.0 // indirect
 	google.golang.org/protobuf v1.36.12 // indirect
 )
-
-replace github.com/livekit/storage/objects => ./objects

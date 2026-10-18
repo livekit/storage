@@ -30,6 +30,12 @@ jobs:
       - name: Download Go modules
         run: go mod download && (cd e2e && go mod download)
 
+      # The root module builds against the objects version it requires, which
+      # must be the interfaces in this tree: a change to objects/ needs the
+      # requirement bumped to the commit that made it.
+      - name: objects requirement matches objects/
+        run: diff -r --exclude=go.sum --exclude=LICENSE "$(go list -m -f '{{.Dir}}' github.com/livekit/storage/objects)" objects
+
       - name: Lint
         uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
         with:
@@ -47,6 +53,7 @@ jobs:
         run: |
           set -euo pipefail
           go test -race -json -v ./... 2>&1 | gotestfmt
+          (cd objects && go vet ./...)
           cd e2e && go test -race -json -v -skip '^Test(Floci|MinIO)' ./... 2>&1 | gotestfmt
 
   # Every backend end to end against its floci emulator (e2e/floci_test.go),
