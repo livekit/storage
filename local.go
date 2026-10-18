@@ -274,15 +274,17 @@ func (u *localUploader) ListObjects(_ context.Context, prefix string) ([]string,
 }
 
 func (u *localUploader) DeleteObjects(ctx context.Context, storagePaths []string) error {
+	failed := map[string]error{}
 	for _, p := range storagePaths {
-		if err := ctx.Err(); err != nil {
-			return err
+		err := ctx.Err()
+		if err == nil {
+			err = u.deleteObject(p)
 		}
-		if err := u.deleteObject(p); err != nil {
-			return err
+		if err != nil {
+			failed[p] = err
 		}
 	}
-	return nil
+	return deleteError(failed)
 }
 
 // deleteObject removes the file, then each parent directory it leaves empty. A

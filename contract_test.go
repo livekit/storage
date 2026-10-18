@@ -237,9 +237,13 @@ func TestS3DeleteObjectsKeyErrors(t *testing.T) {
 			err = s.DeleteObjects(context.Background(), []string{"a", "b"})
 			if tc.deleted {
 				require.NoError(t, err)
-			} else {
-				require.ErrorContains(t, err, tc.code)
+				return
 			}
+			// The caller learns which keys are left, and only those.
+			var failed *storage.DeleteError
+			require.ErrorAs(t, err, &failed)
+			require.Len(t, failed.Failed, 1)
+			require.ErrorContains(t, failed.Failed["b"], tc.code)
 		})
 	}
 }

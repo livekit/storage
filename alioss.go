@@ -224,6 +224,7 @@ func (s *aliOSSStorage) ListObjects(ctx context.Context, prefix string) ([]strin
 // no per-key errors, only the keys it deleted, so a key it leaves out fails the
 // call unless it holds nothing.
 func (s *aliOSSStorage) DeleteObjects(ctx context.Context, storagePaths []string) error {
+	failed := map[string]error{}
 	for i := 0; i < len(storagePaths); i += 1000 {
 		batch := storagePaths[i:min(i+1000, len(storagePaths))]
 		var res oss.DeleteObjectsResult
@@ -232,7 +233,10 @@ func (s *aliOSSStorage) DeleteObjects(ctx context.Context, storagePaths []string
 			return err
 		})
 		if err != nil {
-			return wrapAliOSSObjectError(err)
+			for _, k := range batch {
+				failed[k] = wrapAliOSSObjectError(err)
+			}
+			continue
 		}
 		deleted := make(map[string]bool, len(res.DeletedObjects))
 		for _, k := range res.DeletedObjects {
@@ -243,15 +247,15 @@ func (s *aliOSSStorage) DeleteObjects(ctx context.Context, storagePaths []string
 				continue
 			}
 			exists, err := s.ObjectExists(ctx, k)
-			if err != nil {
-				return err
+			if err == nil && exists {
+				err = errors.New("delete not confirmed")
 			}
-			if exists {
-				return fmt.Errorf("storage: delete of %s not confirmed", k)
+			if err != nil {
+				failed[k] = err
 			}
 		}
 	}
-	return nil
+	return deleteError(failed)
 }
 
 // aliOSSAttempts is how many times a call is sent: the v1 SDK never retries.

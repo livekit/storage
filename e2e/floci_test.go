@@ -232,18 +232,25 @@ func testConditionalCommit(t *testing.T, s storage.Storage, endpoint string, at 
 	require.Equal(t, commits.Load(), conditional.Load(), "a commit went out without the condition")
 }
 
-// testDeletesRefused deletes where the store refuses it: the object is still
-// there, so the call must fail, missing keys alongside it or not.
+// testDeletesRefused deletes where the store refuses it: the objects are still
+// there, so the call must fail, naming each of them, past the first refusal.
 func testDeletesRefused(t *testing.T, s, noDeletes storage.Storage) {
 	ctx := t.Context()
-	path := fmt.Sprintf("deletes-refused-%d", time.Now().UnixNano())
-	require.NoError(t, s.PutObject(ctx, path, []byte("kept"), storage.PutOptions{}))
-	t.Cleanup(func() { _ = s.DeleteObjects(context.Background(), []string{path}) })
+	prefix := fmt.Sprintf("deletes-refused-%d/", time.Now().UnixNano())
+	paths := []string{prefix + "a", prefix + "b"}
+	for _, p := range paths {
+		require.NoError(t, s.PutObject(ctx, p, []byte("kept"), storage.PutOptions{}))
+	}
+	t.Cleanup(func() { _ = s.DeleteObjects(context.Background(), paths) })
 
-	require.Error(t, noDeletes.DeleteObjects(ctx, []string{path + "-missing", path}))
-	exists, err := s.ObjectExists(ctx, path)
-	require.NoError(t, err)
-	require.True(t, exists)
+	var failed *storage.DeleteError
+	require.ErrorAs(t, noDeletes.DeleteObjects(ctx, paths), &failed)
+	for _, p := range paths {
+		require.Contains(t, failed.Failed, p)
+		exists, err := s.ObjectExists(ctx, p)
+		require.NoError(t, err)
+		require.True(t, exists)
+	}
 }
 
 // testWriteOnly writes IfAbsent with credentials that may write but not read:

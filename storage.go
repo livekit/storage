@@ -31,6 +31,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -47,6 +48,7 @@ type (
 	Bucket              = objects.Bucket
 	PutOptions          = objects.PutOptions
 	ErrorWithStatusCode = objects.ErrorWithStatusCode
+	DeleteError         = objects.DeleteError
 )
 
 var (
@@ -141,28 +143,38 @@ const (
 // delete is one round trip per object.
 const deleteConcurrency = 16
 
-// deleteEach deletes every path with del, deleteConcurrency at a time, and
-// returns the first error. A failure stops new deletes but lets those in
-// flight finish, rather than cancel them: an OCI call canceled mid-flight
-// races inside the SDK. A retry is safe, as del treats a missing path as
-// deleted.
+// deleteEach deletes every path with del, deleteConcurrency at a time, where a
+// store takes one path per request. Once the context ends, the paths left are
+// failed without a request: an OCI call canceled mid-flight races in its SDK.
 func deleteEach(ctx context.Context, paths []string, del func(ctx context.Context, path string) error) error {
+	var mu sync.Mutex
+	failed := map[string]error{}
 	var g errgroup.Group
 	g.SetLimit(deleteConcurrency)
-	var failed atomic.Bool
 	for _, p := range paths {
-		if failed.Load() {
-			break
-		}
 		g.Go(func() error {
-			err := del(ctx, p)
-			if err != nil {
-				failed.Store(true)
+			err := ctx.Err()
+			if err == nil {
+				err = del(ctx, p)
 			}
-			return err
+			if err != nil {
+				mu.Lock()
+				failed[p] = err
+				mu.Unlock()
+			}
+			return nil
 		})
 	}
-	return g.Wait()
+	_ = g.Wait()
+	return deleteError(failed)
+}
+
+// deleteError is a *DeleteError for the paths in failed, or nil for none.
+func deleteError(failed map[string]error) error {
+	if len(failed) == 0 {
+		return nil
+	}
+	return &DeleteError{Failed: failed}
 }
 
 // idleTimeout is how long a connection may move no bytes either way. A store

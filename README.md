@@ -5,12 +5,12 @@ Object storage on S3 and S3-compatible stores, GCS, Azure Blob, OCI Object Stora
 - `Bucket` (`storage/objects`): `PutObject`, `UploadObject` (streams), `GetObject`, `GetObjectRange`, `DownloadObject` (to any `io.Writer`), `ObjectExists`, `ListObjects` (byte order), `DeleteObjects`, `PresignedURL`.
 - `Storage` is `Bucket` plus `UploadFile` and `DownloadFile`. `DownloadFile` replaces the local file only once the whole object is read.
 - `PutOptions{ContentType, IfAbsent}` on every write. `IfAbsent` refuses to replace an object, atomically where the store honors the condition.
-- Errors: a missing object is `ErrNotFound`, a write `IfAbsent` refuses is `ErrExists` (`errors.Is`); `ErrorWithStatusCode` carries the store's HTTP status (`errors.As`).
+- Errors: a missing object is `ErrNotFound`, a write `IfAbsent` refuses is `ErrExists` (`errors.Is`); `ErrorWithStatusCode` carries the store's HTTP status and `DeleteError` the paths a delete left (`errors.As`).
 - `storage/objects` imports no provider SDK, so a fake or a library can implement or accept the interfaces without pulling in every SDK.
 
 ## Behavior
 
-- **S3 semantics** where stores differ. `DeleteObjects` of a missing path succeeds, as S3's delete does, and fails while any path it was given still holds an object, so a retry after a partial failure is safe.
+- **S3 semantics** where stores differ. `DeleteObjects` of a missing path succeeds, as S3's delete does. It tries every path, and when some are not deleted fails with a `*DeleteError` whose `Failed` names each one with its error (`errors.As`); every other path is deleted, and a retry is safe.
 - **Keys** are the store's keys as given. The local directory, as a filesystem, drops a leading `/`, cleans `//` and `.`, refuses keys outside it, and cannot hold both `a` and `a/b`.
 - **Timeouts**: a connection that moves no bytes either way for 5 minutes is cut; a slow but live transfer never is. The context bounds the call.
 - **Retries**: every store retries throttling, 5xx and network errors with backoff, including AliOSS, whose SDK does not. A stream given to `UploadObject` is sent once on AliOSS.

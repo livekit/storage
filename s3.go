@@ -485,7 +485,7 @@ func (s *s3Storage) ListObjects(ctx context.Context, prefix string) ([]string, e
 
 // DeleteObjects fails when any key fails, even within a batch S3 accepted.
 func (s *s3Storage) DeleteObjects(ctx context.Context, storagePaths []string) error {
-	client := s.client
+	failed := map[string]error{}
 	for i := 0; i < len(storagePaths); i += 1000 {
 		batch := storagePaths[i:min(i+1000, len(storagePaths))]
 		objects := make([]types.ObjectIdentifier, 0, len(batch))
@@ -501,23 +501,22 @@ func (s *s3Storage) DeleteObjects(ctx context.Context, storagePaths []string) er
 		if !awsEndpoint(s.conf.Endpoint) {
 			input.ChecksumAlgorithm = types.ChecksumAlgorithmSha256
 		}
-		out, err := client.DeleteObjects(ctx, input)
+		out, err := s.client.DeleteObjects(ctx, input)
 		if err != nil {
-			return wrapS3Error(err)
+			for _, p := range batch {
+				failed[p] = wrapS3Error(err)
+			}
+			continue
 		}
-		// Any key the store reports that is not already gone is still there,
-		// so the call fails rather than leave it behind unseen.
-		var errs []error
+		// S3 answers 200 and lists the keys it could not delete. NoSuchKey is
+		// a key already gone; any other is still there.
 		for _, e := range out.Errors {
 			if aws.ToString(e.Code) != "NoSuchKey" {
-				errs = append(errs, fmt.Errorf("storage: delete %s: %s %s", aws.ToString(e.Key), aws.ToString(e.Code), aws.ToString(e.Message)))
+				failed[aws.ToString(e.Key)] = fmt.Errorf("%s: %s", aws.ToString(e.Code), aws.ToString(e.Message))
 			}
 		}
-		if err := errors.Join(errs...); err != nil {
-			return err
-		}
 	}
-	return nil
+	return deleteError(failed)
 }
 
 func (s *s3Storage) PresignedURL(ctx context.Context, storagePath string, expiration time.Duration) (string, error) {

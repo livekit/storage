@@ -22,6 +22,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
+	"slices"
 	"time"
 )
 
@@ -58,9 +60,11 @@ type Bucket interface {
 	// ListObjects returns every key under prefix, recursively, as full paths,
 	// in byte order.
 	ListObjects(ctx context.Context, prefix string) ([]string, error)
-	// DeleteObjects succeeds for paths that hold nothing, as S3's delete does,
-	// and fails when a path is not deleted; some may be deleted by then, and a
-	// retry is safe. GCS, Azure and OCI send one request per path, 16 at once.
+	// DeleteObjects succeeds for paths that hold nothing, as S3's delete does.
+	// It tries every path, and when some are not deleted fails with a
+	// *DeleteError naming them; every other path is deleted, and a retry of the
+	// same paths is safe. GCS, Azure and OCI send one request per path, 16 at
+	// once.
 	DeleteObjects(ctx context.Context, storagePaths []string) error
 
 	// PresignedURL is a GET URL; local returns a file:// URL.
@@ -93,6 +97,29 @@ var (
 	ErrNotFound = errors.New("storage: object not found")
 	ErrExists   = errors.New("storage: object exists")
 )
+
+// DeleteError is DeleteObjects' failure: Failed holds each path it did not
+// delete, with why. Every other path it was given is deleted.
+type DeleteError struct {
+	Failed map[string]error
+}
+
+func (e *DeleteError) Error() string {
+	paths := slices.Sorted(maps.Keys(e.Failed))
+	msg := fmt.Sprintf("storage: %d paths not deleted", len(paths))
+	for i, p := range paths {
+		if i == 3 {
+			return msg + fmt.Sprintf(", and %d more", len(paths)-i)
+		}
+		msg += fmt.Sprintf(", %s: %v", p, e.Failed[p])
+	}
+	return msg
+}
+
+// Unwrap is the paths' errors, so errors.Is and errors.As see them.
+func (e *DeleteError) Unwrap() []error {
+	return slices.Collect(maps.Values(e.Failed))
+}
 
 // ErrorWithStatusCode carries the HTTP status a store answered with, under
 // ErrNotFound or ErrExists where those apply; find it with errors.As.
