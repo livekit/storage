@@ -105,12 +105,21 @@ func NewGCP(conf *GCPConfig) (Storage, error) {
 		opts = append(opts, option.WithoutAuthentication())
 	}
 
-	client, err := newGCSClient(opts, t)
-	if err != nil {
+	// The client sends through t, with the SDK's auth added on top. The SDK
+	// chooses a client certificate and the mTLS endpoint only on a transport of
+	// its own, so where GOOGLE_API_USE_CLIENT_CERTIFICATE asks for them, the
+	// client keeps the SDK's, without this package's timeouts and proxy.
+	ctx := context.Background()
+	if os.Getenv("GOOGLE_API_USE_CLIENT_CERTIFICATE") != "true" {
+		authed, err := htransport.NewTransport(ctx, t, append(opts, option.WithScopes(storage.ScopeFullControl, "https://www.googleapis.com/auth/cloud-platform"))...)
+		if err != nil {
+			return nil, err
+		}
+		opts = append(opts, option.WithHTTPClient(&http.Client{Transport: authed}))
+	}
+	if u.client, err = storage.NewClient(ctx, opts...); err != nil {
 		return nil, err
 	}
-
-	u.client = client
 	return u, nil
 }
 
@@ -145,7 +154,7 @@ func (s *gcpStorage) location(storagePath string) string {
 	}).String()
 }
 
-func (s *gcpStorage) presignedURL(storagePath string, expiration time.Duration) (string, error) {
+func (s *gcpStorage) PresignedURL(_ context.Context, storagePath string, expiration time.Duration) (string, error) {
 	opts := &storage.SignedURLOptions{
 		Method:  "GET",
 		Expires: time.Now().Add(expiration),
@@ -301,10 +310,6 @@ func (s *gcpStorage) DeleteObjects(ctx context.Context, storagePaths []string) e
 	})
 }
 
-func (s *gcpStorage) PresignedURL(_ context.Context, storagePath string, expiration time.Duration) (string, error) {
-	return s.presignedURL(storagePath, expiration)
-}
-
 func wrapGCPObjectError(err error) error {
 	if err == nil {
 		return nil
@@ -313,21 +318,4 @@ func wrapGCPObjectError(err error) error {
 		return fmt.Errorf("%w: %w", ErrNotFound, wrapGCPError(err))
 	}
 	return wrapGCPError(err)
-}
-
-// newGCSClient builds a client that sends through t, with the SDK's auth
-// added on top. The SDK chooses a client certificate and the mTLS endpoint only
-// on a transport of its own, so where GOOGLE_API_USE_CLIENT_CERTIFICATE asks
-// for them, the client keeps the SDK's, without this package's timeouts and
-// proxy.
-func newGCSClient(opts []option.ClientOption, t *http.Transport) (*storage.Client, error) {
-	ctx := context.Background()
-	if os.Getenv("GOOGLE_API_USE_CLIENT_CERTIFICATE") == "true" {
-		return storage.NewClient(ctx, opts...)
-	}
-	authed, err := htransport.NewTransport(ctx, t, append(opts, option.WithScopes(storage.ScopeFullControl, "https://www.googleapis.com/auth/cloud-platform"))...)
-	if err != nil {
-		return nil, err
-	}
-	return storage.NewClient(ctx, append(opts, option.WithHTTPClient(&http.Client{Transport: authed}))...)
 }

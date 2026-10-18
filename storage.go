@@ -54,10 +54,6 @@ var (
 	ErrExists   = objects.ErrExists
 )
 
-func New(conf Config) (Storage, error) {
-	return newStorage(conf)
-}
-
 // presentBeforeUpload reports whether IfAbsent can refuse an upload before it is
 // sent, because the object is there. A check that fails, such as a 403 for
 // credentials that may write but not read, leaves the refusal to the condition
@@ -178,12 +174,6 @@ func setDialTimeouts(d *net.Dialer) {
 	d.KeepAlive = 30 * time.Second
 }
 
-// setTimeouts sets t's TLS timeout and has its connections time out when idle.
-func setTimeouts(t *http.Transport) {
-	t.TLSHandshakeTimeout = tlsHandshakeTimeout
-	setIdleTimeout(t)
-}
-
 // setIdleTimeout has t's connections fail once idle for idleTimeout. A dialer t
 // already has, such as one through a VPN, is kept.
 func setIdleTimeout(t *http.Transport) {
@@ -290,7 +280,8 @@ func transportWithTimeouts(rt http.RoundTripper) *http.Transport {
 		}
 	}
 	t.MaxIdleConnsPerHost = max(t.MaxIdleConnsPerHost, maxIdleConnsPerHost)
-	setTimeouts(t)
+	t.TLSHandshakeTimeout = tlsHandshakeTimeout
+	setIdleTimeout(t)
 	return t
 }
 

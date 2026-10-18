@@ -102,7 +102,7 @@ func (s *aliOSSStorage) DownloadFile(ctx context.Context, storagePath, filepath 
 	})
 }
 
-func (s *aliOSSStorage) presignedURL(storagePath string, expiration time.Duration) (string, error) {
+func (s *aliOSSStorage) PresignedURL(_ context.Context, storagePath string, expiration time.Duration) (string, error) {
 	u, err := s.bucket.SignURL(storagePath, oss.HTTPGet, int64(expiration.Seconds()))
 	if err != nil {
 		return "", wrapAliOSSError(err)
@@ -254,10 +254,6 @@ func (s *aliOSSStorage) DeleteObjects(ctx context.Context, storagePaths []string
 	return nil
 }
 
-func (s *aliOSSStorage) PresignedURL(_ context.Context, storagePath string, expiration time.Duration) (string, error) {
-	return s.presignedURL(storagePath, expiration)
-}
-
 // aliOSSAttempts is how many times a call is sent: the v1 SDK never retries.
 const aliOSSAttempts = 3
 
@@ -267,7 +263,16 @@ const aliOSSAttempts = 3
 func aliOSSRetry(ctx context.Context, call func() error) error {
 	var err error
 	for attempt := range aliOSSAttempts {
-		if err = call(); err == nil || ctx.Err() != nil || !aliOSSRetryable(err) {
+		if err = call(); err == nil || ctx.Err() != nil {
+			return err
+		}
+		var svcErr oss.ServiceError
+		var netErr net.Error
+		retryable := errors.As(err, &netErr) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, syscall.ECONNRESET)
+		if errors.As(err, &svcErr) {
+			retryable = svcErr.StatusCode >= 500 || svcErr.StatusCode == http.StatusTooManyRequests
+		}
+		if !retryable {
 			return err
 		}
 		backoff := 200 * time.Millisecond << attempt
@@ -278,15 +283,6 @@ func aliOSSRetry(ctx context.Context, call func() error) error {
 		}
 	}
 	return err
-}
-
-func aliOSSRetryable(err error) bool {
-	var svcErr oss.ServiceError
-	if errors.As(err, &svcErr) {
-		return svcErr.StatusCode >= 500 || svcErr.StatusCode == http.StatusTooManyRequests
-	}
-	var netErr net.Error
-	return errors.As(err, &netErr) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, syscall.ECONNRESET)
 }
 
 func wrapAliOSSObjectError(err error) error {

@@ -285,52 +285,46 @@ func (s *s3Storage) send(ctx context.Context, input *s3.PutObjectInput, opts ...
 	opts = append(opts, func(u *manager.Uploader) {
 		u.PartSize = s3UploadPartSize
 		u.LeavePartsOnError = true
+		if !awsEndpoint(s.conf.Endpoint) {
+			u.ClientOptions = append(u.ClientOptions, clearMultipartChecksum)
+		}
 	})
-	_, err := s.uploader(opts...).Upload(ctx, input)
+	_, err := manager.NewUploader(s.client, opts...).Upload(ctx, input)
+
 	var failed manager.MultiUploadFailure
 	if errors.As(err, &failed) {
-		go s.abort(context.WithoutCancel(ctx), input.Key, failed.UploadID())
+		go func() {
+			ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Minute)
+			defer cancel()
+			_, _ = s.client.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{
+				Bucket:   aws.String(s.conf.Bucket),
+				Key:      input.Key,
+				UploadId: aws.String(failed.UploadID()),
+			})
+		}()
 	}
 	return err
 }
 
-func (s *s3Storage) abort(ctx context.Context, key *string, uploadID string) {
-	ctx, cancel := context.WithTimeout(ctx, time.Minute)
-	defer cancel()
-	_, _ = s.client.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{
-		Bucket:   aws.String(s.conf.Bucket),
-		Key:      key,
-		UploadId: aws.String(uploadID),
+// clearMultipartChecksum drops the CRC32 the uploader forces on multipart
+// uploads, which UploadPart sends as an aws-chunked trailer that stores other
+// than AWS may reject, before any checksum middleware sees it.
+func clearMultipartChecksum(o *s3.Options) {
+	o.APIOptions = append(o.APIOptions, func(stack *middleware.Stack) error {
+		return stack.Initialize.Add(middleware.InitializeMiddlewareFunc("ClearMultipartChecksum",
+			func(ctx context.Context, in middleware.InitializeInput, next middleware.InitializeHandler) (
+				middleware.InitializeOutput, middleware.Metadata, error,
+			) {
+				switch v := in.Parameters.(type) {
+				case *s3.CreateMultipartUploadInput:
+					v.ChecksumAlgorithm = ""
+				case *s3.UploadPartInput:
+					v.ChecksumAlgorithm = ""
+				}
+				return next.HandleInitialize(ctx, in)
+			},
+		), middleware.Before)
 	})
-}
-
-func (s *s3Storage) uploader(opts ...func(*manager.Uploader)) *manager.Uploader {
-	// Uploader forces a CRC32 ChecksumAlgorithm on multipart uploads,
-	// which makes UploadPart use a trailing checksum encoded as Content-Encoding:
-	// aws-chunked. Non-AWS S3-compatible providers (e.g. OCI) don't support
-	// this, so clear the algorithm before any checksum middleware sees it.
-	return manager.NewUploader(s.client, append(opts, func(u *manager.Uploader) {
-		if !awsEndpoint(s.conf.Endpoint) {
-			u.ClientOptions = append(u.ClientOptions, func(o *s3.Options) {
-				o.APIOptions = append(o.APIOptions, func(stack *middleware.Stack) error {
-					return stack.Initialize.Add(middleware.InitializeMiddlewareFunc(
-						"ClearMultipartChecksum",
-						func(ctx context.Context, in middleware.InitializeInput, next middleware.InitializeHandler) (
-							middleware.InitializeOutput, middleware.Metadata, error,
-						) {
-							switch v := in.Parameters.(type) {
-							case *s3.CreateMultipartUploadInput:
-								v.ChecksumAlgorithm = ""
-							case *s3.UploadPartInput:
-								v.ChecksumAlgorithm = ""
-							}
-							return next.HandleInitialize(ctx, in)
-						},
-					), middleware.Before)
-				})
-			})
-		}
-	})...)
 }
 
 func (s *s3Storage) location(storagePath string) string {

@@ -90,10 +90,6 @@ func NewAzure(conf *AzureConfig) (Storage, error) {
 	return s, err
 }
 
-func (s *azureBLOBStorage) location(storagePath string) string {
-	return s.blobURL(storagePath).String()
-}
-
 func azureServiceURL(conf *AzureConfig) string {
 	if conf.Endpoint != "" {
 		return conf.Endpoint
@@ -130,7 +126,7 @@ func (s *azureBLOBStorage) UploadFile(ctx context.Context, storagePath, filepath
 	if err != nil {
 		return "", 0, wrapAzureWriteError(err, opts.IfAbsent)
 	}
-	return s.location(storagePath), stat.Size(), nil
+	return s.blobURL(storagePath).String(), stat.Size(), nil
 }
 
 func (s *azureBLOBStorage) DownloadFile(ctx context.Context, storagePath, filepath string) (int64, error) {
@@ -143,7 +139,7 @@ func (s *azureBLOBStorage) DownloadFile(ctx context.Context, storagePath, filepa
 	})
 }
 
-func (s *azureBLOBStorage) presignedUrlWithToken(ctx context.Context, storagePath string, expiration time.Duration) (string, error) {
+func (s *azureBLOBStorage) presignWithUserDelegation(ctx context.Context, storagePath string, expiration time.Duration) (string, error) {
 	if s.conf.TokenCredential == nil {
 		return "", errors.New("OAuth required")
 	}
@@ -323,7 +319,7 @@ func (s *azureBLOBStorage) DeleteObjects(ctx context.Context, storagePaths []str
 // set, in which case it signs with a user delegation key as Storage does.
 func (s *azureBLOBStorage) PresignedURL(ctx context.Context, storagePath string, expiration time.Duration) (string, error) {
 	if s.conf.TokenCredential != nil {
-		return s.presignedUrlWithToken(ctx, storagePath, expiration)
+		return s.presignWithUserDelegation(ctx, storagePath, expiration)
 	}
 	// HTTPS only, as the user delegation SAS, unless the endpoint itself is
 	// plain HTTP, as an emulator's.

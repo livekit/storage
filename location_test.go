@@ -137,7 +137,7 @@ func TestAzureLocation(t *testing.T) {
 	}
 	for _, tc := range cases {
 		s := &azureBLOBStorage{conf: &tc.conf}
-		got := s.location(tc.storagePath)
+		got := s.blobURL(tc.storagePath).String()
 		require.Equal(t, tc.want, got, tc.name)
 		requireWellFormedHTTPLocation(t, got, tc.name)
 	}

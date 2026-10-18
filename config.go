@@ -34,7 +34,8 @@ type (
 	ProxyConfig  = config.ProxyConfig
 )
 
-func newStorage(conf Config) (Storage, error) {
+// New builds the Storage a config describes.
+func New(conf Config) (Storage, error) {
 	switch c := conf.(type) {
 	case *AliOSSConfig:
 		return NewAliOSS(c)

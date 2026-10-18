@@ -137,18 +137,14 @@ func uploadIfAbsent(dst string, body io.Reader) (string, int64, error) {
 	if err != nil {
 		return "", 0, err
 	}
-	syncDir(filepath.Dir(dst))
-	return dst, n, nil
-}
-
-// syncDir persists the names in dir, so an object linked into it survives a
-// crash. It is best effort: some filesystems, such as FUSE mounts, refuse to
-// sync a directory, and the object's bytes are synced already.
-func syncDir(dir string) {
-	if d, err := os.Open(dir); err == nil {
+	// The directory holds the new name: syncing it keeps the object across a
+	// crash. Best effort, as some filesystems, FUSE mounts among them, refuse
+	// to sync a directory.
+	if d, err := os.Open(filepath.Dir(dst)); err == nil {
 		_ = d.Sync()
 		_ = d.Close()
 	}
+	return dst, n, nil
 }
 
 func (u *localUploader) GetObject(_ context.Context, storagePath string) ([]byte, error) {

@@ -198,7 +198,7 @@ func (s *ociStorage) DownloadFile(ctx context.Context, storagePath, filepath str
 // presigned URL, a PAR is a durable object: it is listable and revocable, it
 // costs an API call to mint, and it needs PAR_MANAGE on the bucket. Its access
 // URI is returned only here and cannot be read back afterwards.
-func (s *ociStorage) presignedURL(ctx context.Context, storagePath string, expiration time.Duration) (string, error) {
+func (s *ociStorage) PresignedURL(ctx context.Context, storagePath string, expiration time.Duration) (string, error) {
 	name := fmt.Sprintf("livekit-storage-%s-%d", storagePath, time.Now().UnixNano())
 	expires := common.SDKTime{Time: time.Now().Add(expiration)}
 
@@ -461,10 +461,6 @@ func (s *ociStorage) DeleteObjects(ctx context.Context, storagePaths []string) e
 		}
 		return nil
 	})
-}
-
-func (s *ociStorage) PresignedURL(ctx context.Context, storagePath string, expiration time.Duration) (string, error) {
-	return s.presignedURL(ctx, storagePath, expiration)
 }
 
 func wrapOCIObjectError(err error) error {
