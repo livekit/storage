@@ -1,0 +1,53 @@
+name: objects version
+
+permissions:
+  contents: write
+  actions: write
+
+on:
+  pull_request:
+    paths: ["objects/**"]
+
+jobs:
+  # Raises the objects version go.mod requires when a PR changes objects/
+  # under one already released, so whoever changes the interfaces does
+  # nothing more. A fork's branch cannot be pushed to: there, the test
+  # workflow's check prints the command instead.
+  bump:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.head_ref }}
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: "go.mod"
+          cache: false
+
+      - name: Raise the objects version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ github.head_ref }}
+        run: |
+          v=$(awk '$1 == "github.com/livekit/storage/objects" {print $2}' go.mod)
+          # A version not yet released, or released with these interfaces, stands.
+          if ! git rev-parse -q --verify "refs/tags/objects/$v" >/dev/null || git diff --quiet "refs/tags/objects/$v" HEAD -- objects; then
+            exit 0
+          fi
+          # The next minor after the latest release: before v1, any change may
+          # break a caller.
+          latest=$(git tag -l 'objects/v*' --sort=-v:refname | head -1)
+          next=$(echo "${latest#objects/}" | awk -F. '{print $1 "." $2+1 ".0"}')
+          go mod edit -require=github.com/livekit/storage/objects@$next
+          (cd e2e && go mod edit -require=github.com/livekit/storage/objects@$next)
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "objects: $next"
+          git push origin "HEAD:$BRANCH"
+          # A push with this token starts no workflow, so the checks for the
+          # new head are started here.
+          gh workflow run test.yaml --ref "$BRANCH"

@@ -6,7 +6,7 @@ Object storage on S3 and S3-compatible stores, GCS, Azure Blob, OCI Object Stora
 - `Storage` is `Bucket` plus `UploadFile` and `DownloadFile`. `DownloadFile` replaces the local file only once the whole object is read.
 - `PutOptions{ContentType, IfAbsent}` on every write. `IfAbsent` refuses to replace an object, atomically where the store honors the condition.
 - Errors: a missing object is `ErrNotFound`, a write `IfAbsent` refuses is `ErrExists` (`errors.Is`); `ErrorWithStatusCode` carries the store's HTTP status and `DeleteError` the paths a delete left (`errors.As`).
-- `storage/objects` is a module of its own with no requirements, so a fake or a library can implement or accept the interfaces without inheriting any SDK or its versions. A PR that changes `objects/` raises the `objects` version in `go.mod`; CI fails without it and prints the command. Nobody tags: the version is tagged `objects/vX.Y.Z` on main when the PR merges, and `go.work` builds the repo against `objects/` until then.
+- `storage/objects` holds the interfaces in a module of its own, with no requirements (see Modules).
 
 ## Behavior
 
@@ -16,6 +16,25 @@ Object storage on S3 and S3-compatible stores, GCS, Azure Blob, OCI Object Stora
 - **Retries**: every store retries throttling, 5xx and network errors with backoff, including AliOSS, whose SDK does not. A stream given to `UploadObject` is sent once on AliOSS.
 - **Proxy**: `ProxyConfig` (S3, GCS) carries its credentials for http and https targets, honors `NO_PROXY`, and never proxies the cloud metadata services.
 - **Local writes** go in place, as a file is written, so mounted volumes and file watchers see one write; `IfAbsent` writes a temporary file (`.upload-*`, never listed) and links it into place.
+
+## Modules
+
+| module | holds | requires |
+|---|---|---|
+| `github.com/livekit/storage` | the backends, `New`, the configs | every provider SDK, `livekit/protocol` |
+| `github.com/livekit/storage/objects` | `Bucket`, `Storage`, `PutOptions`, the errors | nothing |
+| `github.com/livekit/storage/e2e` | the end-to-end suites | `dockertest` |
+
+Why `objects` is its own module:
+
+- A module's requirements take part in the version selection of every module that requires it, whichever packages it imports. In the root module, the interfaces would carry every SDK's and `livekit/protocol`'s versions (grpc, otel) into each fake or library that implements or accepts them.
+- With no requirements, implementing them costs no dependency: gosim's `fakes/objstore` `Bucket` is an `objects.Bucket`.
+
+How its versions work:
+
+- `go.mod` names the `objects` version the root requires; `go.work` builds the repo against `objects/` in the tree.
+- A PR that changes `objects/` under a released version gets the next minor version committed to it by `objects-version.yaml`. From a fork, CI fails and prints the command.
+- On merge, `objects-release.yaml` tags `objects/vX.Y.Z` on main. Squash merges drop a branch's commits, so only a version tagged on main stays resolvable.
 
 ## Tests
 
