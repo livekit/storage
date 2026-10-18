@@ -22,43 +22,52 @@ jobs:
     if: github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.head_ref }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      # A version not yet released, or released with these interfaces, stands.
+      # Otherwise the next minor after the latest release: before v1, any
+      # change may break a caller.
+      - name: Next objects version
+        id: next
+        run: |
+          v=$(awk '$1 == "github.com/livekit/storage/objects" {print $2}' go.mod)
+          if ! git rev-parse -q --verify "refs/tags/objects/$v" >/dev/null || git diff --quiet "refs/tags/objects/$v" HEAD -- objects; then
+            exit 0
+          fi
+          latest=$(git tag -l 'objects/v*' --sort=-v:refname | head -1)
+          echo "version=$(echo "${latest#objects/}" | awk -F. '{print $1 "." $2+1 ".0"}')" >> "$GITHUB_OUTPUT"
+
       - id: app
+        if: steps.next.outputs.version != ''
         uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1.12.0
         with:
           app-id: ${{ vars.REPO_WRITER_GH_APP_ID }}
           private-key: ${{ secrets.REPO_WRITER_GH_APP_PRIVATE_KEY }}
 
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ github.head_ref }}
-          fetch-depth: 0
-          token: ${{ steps.app.outputs.token }}
-
       - name: Set up Go
+        if: steps.next.outputs.version != ''
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: "go.mod"
           cache: false
 
-      - name: Raise the objects version
+      - name: Commit the version
+        if: steps.next.outputs.version != ''
         env:
+          NEXT: ${{ steps.next.outputs.version }}
           BRANCH: ${{ github.head_ref }}
+          REPO: ${{ github.repository }}
           GH_TOKEN: ${{ steps.app.outputs.token }}
           APP: ${{ steps.app.outputs.app-slug }}
         run: |
-          v=$(awk '$1 == "github.com/livekit/storage/objects" {print $2}' go.mod)
-          # A version not yet released, or released with these interfaces, stands.
-          if ! git rev-parse -q --verify "refs/tags/objects/$v" >/dev/null || git diff --quiet "refs/tags/objects/$v" HEAD -- objects; then
-            exit 0
-          fi
-          # The next minor after the latest release: before v1, any change may
-          # break a caller.
-          latest=$(git tag -l 'objects/v*' --sort=-v:refname | head -1)
-          next=$(echo "${latest#objects/}" | awk -F. '{print $1 "." $2+1 ".0"}')
-          go mod edit -require=github.com/livekit/storage/objects@$next
-          (cd e2e && go mod edit -require=github.com/livekit/storage/objects@$next)
+          go mod edit -require=github.com/livekit/storage/objects@$NEXT
+          (cd e2e && go mod edit -require=github.com/livekit/storage/objects@$NEXT)
           # The app's own identity, so the commit is attributed to it.
           git config user.name "$APP[bot]"
           git config user.email "$(gh api "/users/$APP%5Bbot%5D" --jq .id)+$APP[bot]@users.noreply.github.com"
-          git commit -am "objects: $next"
-          git push origin "HEAD:$BRANCH"
+          git commit -am "objects: $NEXT"
+          git push "https://x-access-token:$GH_TOKEN@github.com/$REPO.git" "HEAD:$BRANCH"
