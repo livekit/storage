@@ -15,11 +15,13 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/sts v1.51.1
 	github.com/aws/smithy-go v1.28.1
 	github.com/googleapis/gax-go/v2 v2.26.2
-	github.com/joho/godotenv v1.5.1
 	github.com/livekit/protocol v1.52.1
+	github.com/livekit/storage/objects v0.1.0
 	github.com/oracle/oci-go-sdk/v65 v65.126.1
 	github.com/stretchr/testify v1.12.1
+	golang.org/x/net v0.59.0
 	golang.org/x/oauth2 v0.37.0
+	golang.org/x/sync v0.23.0
 	google.golang.org/api v0.300.0
 )
 
@@ -88,8 +90,6 @@ require (
 	go.yaml.in/yaml/v3 v3.0.5 // indirect
 	golang.org/x/crypto v0.57.0 // indirect
 	golang.org/x/exp v0.0.0-20260813180055-c1d0aacb2297 // indirect
-	golang.org/x/net v0.59.0 // indirect
-	golang.org/x/sync v0.23.0 // indirect
 	golang.org/x/sys v0.48.0 // indirect
 	golang.org/x/text v0.42.0 // indirect
 	golang.org/x/time v0.16.0 // indirect

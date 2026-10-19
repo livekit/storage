@@ -1,0 +1,65 @@
+name: objects version
+
+permissions:
+  contents: write
+  actions: write
+
+on:
+  pull_request:
+    paths: ["objects/**"]
+
+concurrency:
+  group: objects-version-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  # Raises the objects version go.mod requires when a PR changes objects/
+  # under one already released, so whoever changes the interfaces does
+  # nothing more. A fork's branch cannot be pushed to: there, the test
+  # workflow's check prints the command instead.
+  bump:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.head_ref }}
+          fetch-depth: 0
+
+      # A version not yet released, or released with these interfaces, stands.
+      # Otherwise the next minor after the latest release: before v1, any
+      # change may break a caller.
+      - name: Next objects version
+        id: next
+        run: |
+          v=$(awk '$1 == "github.com/livekit/storage/objects" {print $2}' go.mod)
+          if ! git rev-parse -q --verify "refs/tags/objects/$v" >/dev/null || git diff --quiet "refs/tags/objects/$v" HEAD -- objects; then
+            exit 0
+          fi
+          latest=$(git tag -l 'objects/v*' --sort=-v:refname | head -1)
+          echo "version=$(echo "${latest#objects/}" | awk -F. '{print $1 "." $2+1 ".0"}')" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Go
+        if: steps.next.outputs.version != ''
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: "go.mod"
+          cache: false
+
+      # The push is this workflow's token's, which leaves the PR's own runs
+      # for the new commit waiting for approval; the checks are started here
+      # instead, and count for that commit.
+      - name: Commit the version
+        if: steps.next.outputs.version != ''
+        env:
+          NEXT: ${{ steps.next.outputs.version }}
+          BRANCH: ${{ github.head_ref }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          go mod edit -require=github.com/livekit/storage/objects@$NEXT
+          (cd e2e && go mod edit -require=github.com/livekit/storage/objects@$NEXT)
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "objects: $NEXT"
+          git push origin "HEAD:$BRANCH"
+          gh workflow run test.yaml --ref "$BRANCH"

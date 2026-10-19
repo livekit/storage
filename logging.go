@@ -11,6 +11,7 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+
 package storage
 
 import (
@@ -23,20 +24,20 @@ import (
 	"github.com/livekit/protocol/logger"
 )
 
-// S3Logger only logs aws messages on upload failure
-type S3Logger struct {
+// s3Logger only logs aws messages on upload failure
+type s3Logger struct {
 	mu   sync.Mutex
 	msgs []string
 	idx  int
 }
 
-func NewS3Logger() *S3Logger {
-	return &S3Logger{
+func newS3Logger() *s3Logger {
+	return &s3Logger{
 		msgs: make([]string, 10),
 	}
 }
 
-func (l *S3Logger) Logf(classification logging.Classification, format string, v ...interface{}) {
+func (l *s3Logger) Logf(classification logging.Classification, format string, v ...interface{}) {
 	format = "aws %s: " + format
 	v = append([]interface{}{strings.ToLower(string(classification))}, v...)
 
@@ -46,7 +47,7 @@ func (l *S3Logger) Logf(classification logging.Classification, format string, v 
 	l.mu.Unlock()
 }
 
-func (l *S3Logger) WriteLogs() {
+func (l *s3Logger) WriteLogs() {
 	l.mu.Lock()
 	size := len(l.msgs)
 	for range size {
