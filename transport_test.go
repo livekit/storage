@@ -21,9 +21,12 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	"github.com/stretchr/testify/require"
 )
 
@@ -95,6 +98,88 @@ func TestIdleConnKeepsDeadlines(t *testing.T) {
 	_, err = c.Read(make([]byte, 1))
 	require.ErrorIs(t, err, os.ErrDeadlineExceeded)
 	require.Less(t, time.Since(start), 5*time.Second)
+}
+
+// A connection that goes silent without closing held every request HTTP/2
+// shares it with until the idle timeout, which each new request restarted.
+// The S3 client pings a silent connection and closes it, and the next
+// request dials a new one.
+func TestSilentHTTP2ConnectionIsDropped(t *testing.T) {
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("ok"))
+	}))
+	srv.EnableHTTP2 = true
+	l := &freezable{Listener: srv.Listener, frozen: make(chan struct{})}
+	srv.Listener = l
+	srv.StartTLS()
+	t.Cleanup(func() { close(l.frozen); srv.Close() })
+
+	s, err := NewS3(&S3Config{AccessKey: "key", Secret: "secret", Region: "us-east-1", Endpoint: srv.URL, ForcePathStyle: true, Bucket: "bucket"})
+	require.NoError(t, err)
+	tr := s.(*s3Storage).client.Options().HTTPClient.(*awshttp.BuildableClient).GetTransport()
+	tr.TLSClientConfig = srv.Client().Transport.(*http.Transport).TLSClientConfig
+	client := &http.Client{Transport: tr}
+	get := func() error {
+		resp, err := client.Get(srv.URL)
+		if err != nil {
+			return err
+		}
+		resp.Body.Close()
+		require.Equal(t, 2, resp.ProtoMajor)
+		return nil
+	}
+
+	require.NoError(t, get())
+	l.freeze()
+	start := time.Now()
+	for range 3 {
+		_ = get()
+	}
+	require.Less(t, time.Since(start), 2*healthCheck+pingTimeout, "requests held past the health check")
+	// Once the silent connection is closed, a request dials a new one.
+	require.NoError(t, get())
+}
+
+// freezable is a listener whose accepted connections stop reading once
+// frozen, as a peer gone silent without closing.
+type freezable struct {
+	net.Listener
+	frozen chan struct{}
+	mu     sync.Mutex
+	conns  []*freezableConn
+}
+
+type freezableConn struct {
+	net.Conn
+	frozen atomic.Pointer[chan struct{}]
+}
+
+func (c *freezableConn) Read(p []byte) (int, error) {
+	if f := c.frozen.Load(); f != nil {
+		<-*f
+	}
+	return c.Conn.Read(p)
+}
+
+func (l *freezable) Accept() (net.Conn, error) {
+	c, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	fc := &freezableConn{Conn: c}
+	l.mu.Lock()
+	l.conns = append(l.conns, fc)
+	l.mu.Unlock()
+	return fc, nil
+}
+
+// freeze stops every connection accepted so far.
+func (l *freezable) freeze() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for _, c := range l.conns {
+		c.frozen.Store(&l.frozen)
+	}
 }
 
 // stalled is a server that accepts requests and never answers them.

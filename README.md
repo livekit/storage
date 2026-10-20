@@ -12,7 +12,7 @@ Object storage on S3 and S3-compatible stores, GCS, Azure Blob, OCI Object Stora
 
 - **S3 semantics** where stores differ. `DeleteObjects` of a missing path succeeds, as S3's delete does. It tries every path, and when some are not deleted fails with a `*DeleteError` whose `Failed` names each one with its error (`errors.As`); every other path is deleted, and a retry is safe.
 - **Keys** are the store's keys as given. The local directory, as a filesystem, drops a leading `/`, cleans `//` and `.`, refuses keys outside it, and cannot hold both `a` and `a/b`.
-- **Timeouts**: a connection that moves no bytes either way for 5 minutes is cut; a slow but live transfer never is. The context bounds the call.
+- **Timeouts**: a connection that moves no bytes either way for 5 minutes is cut; a slow but live transfer never is. An HTTP/2 connection silent for 10 s is pinged and closed when the ping goes unanswered for 5 s, so requests sharing it do not wait out the 5 minutes. The context bounds the call.
 - **Retries**: every store retries throttling, 5xx and network errors with backoff, including AliOSS, whose SDK does not. A stream given to `UploadObject` is sent once on AliOSS.
 - **Proxy**: `ProxyConfig` (S3, GCS) carries its credentials for http and https targets, honors `NO_PROXY`, and never proxies the cloud metadata services.
 - **Local writes** go in place, as a file is written, so mounted volumes and file watchers see one write; `IfAbsent` writes a temporary file (`.upload-*`, never listed) and links it into place.
