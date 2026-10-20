@@ -218,7 +218,7 @@ func newS3Client(awsConf *aws.Config, conf *S3Config) *s3.Client {
 		// Options run after the SDK sets up the HTTP client, which a defaults
 		// mode does by replacing the dialer the idle timeout wraps.
 		if b, ok := o.HTTPClient.(*awshttp.BuildableClient); ok {
-			o.HTTPClient = b.WithTransportOptions(setIdleTimeout)
+			o.HTTPClient = b.WithTransportOptions(setIdleTimeout, setHealthCheck)
 		}
 	})
 }
