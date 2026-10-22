@@ -15,6 +15,11 @@
 package storage
 
 import (
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/pem"
+	"net/url"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -62,4 +67,26 @@ func TestNewConfigProvider(t *testing.T) {
 		require.NoError(t, err)
 		require.NotNil(t, provider)
 	})
+}
+
+func TestOCILocationHost(t *testing.T) {
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	require.NoError(t, err)
+	pemKey := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
+
+	// A set Namespace keeps NewOCI off the network.
+	s, err := NewOCI(&OCIConfig{
+		TenancyOCID: "ocid1.tenancy.oc1..tenancy",
+		UserOCID:    "ocid1.user.oc1..user",
+		Fingerprint: "aa:bb:cc",
+		PrivateKey:  string(pemKey),
+		Region:      "us-chicago-1",
+		Namespace:   "ns",
+		Bucket:      "bucket",
+	})
+	require.NoError(t, err)
+
+	u, err := url.Parse(s.(*ociStorage).location("a/b.mp4"))
+	require.NoError(t, err)
+	require.Equal(t, "objectstorage.us-chicago-1.oraclecloud.com", u.Host)
 }

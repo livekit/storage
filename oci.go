@@ -81,9 +81,11 @@ func NewOCI(conf *OCIConfig) (Storage, error) {
 		client.HTTPClient = c
 	}
 
-	// The SDK only prepends a scheme to client.Host on the first request, so
-	// read it before GetNamespace below.
-	host := strings.TrimPrefix(client.Host, "https://")
+	// client.Host keeps endpoint options such as {dualStack?ds.oci.:}, which the
+	// SDK resolves on a copy per request, so resolve them the same way here.
+	resolved := client.BaseClient
+	common.UpdateEndpointTemplateForOptions(&resolved)
+	host := strings.TrimPrefix(resolved.Host, "https://")
 	insecure := strings.HasPrefix(host, "http://")
 	host = strings.TrimPrefix(host, "http://")
 
