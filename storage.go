@@ -205,6 +205,21 @@ func setIdleTimeout(t *http.Transport) {
 	}
 }
 
+// HTTP/2 shares a connection among requests, so one that goes silent
+// without closing (a peer or middlebox gone quiet) holds every request on
+// it, and new requests keep joining it, until the idle timeout, which each
+// new request restarts. A connection silent for healthCheck is pinged, and
+// closed when the ping goes unanswered for pingTimeout or a write makes no
+// progress for healthCheck, so the next request, or the retry, dials anew.
+const (
+	healthCheck = 10 * time.Second
+	pingTimeout = 5 * time.Second
+)
+
+func setHealthCheck(t *http.Transport) {
+	t.HTTP2 = &http.HTTP2Config{SendPingTimeout: healthCheck, PingTimeout: pingTimeout, WriteByteTimeout: healthCheck}
+}
+
 // idleConn fails once no bytes move either way for timeout. Each read or write
 // moves both deadlines: the transport's read for the response is already
 // waiting while a long body is still being written. A deadline set from above,
@@ -294,6 +309,7 @@ func transportWithTimeouts(rt http.RoundTripper) *http.Transport {
 	t.MaxIdleConnsPerHost = max(t.MaxIdleConnsPerHost, maxIdleConnsPerHost)
 	t.TLSHandshakeTimeout = tlsHandshakeTimeout
 	setIdleTimeout(t)
+	setHealthCheck(t)
 	return t
 }
 
