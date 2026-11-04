@@ -148,7 +148,7 @@ func getConf(conf *S3Config, cp aws.CredentialsProvider) (*aws.Config, error) {
 		// SDK's read timeout is off, as the idle timeout bounds reads and writes.
 		o.HTTPClient = awshttp.NewBuildableClient().
 			WithDialerOptions(setDialTimeouts).
-			WithTransportOptions(func(t *http.Transport) { t.TLSHandshakeTimeout = tlsHandshakeTimeout }, setProxy).
+			WithTransportOptions(func(t *http.Transport) { t.TLSHandshakeTimeout = tlsHandshakeTimeout }, setHTTP2Pings, setProxy).
 			WithReadTimeout(0)
 
 		return nil
