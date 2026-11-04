@@ -16,6 +16,7 @@ package storage
 
 import (
 	"context"
+	"crypto/tls"
 	"io"
 	"net"
 	"net/http"
@@ -24,8 +25,61 @@ import (
 	"testing"
 	"time"
 
+	gcs "cloud.google.com/go/storage"
 	"github.com/stretchr/testify/require"
 )
+
+// A dead HTTP/2 peer, one that keeps the connection open but answers nothing,
+// not even pings, fails the request well before the idle timeout, with an
+// error the GCS SDK retries. A live one that is merely slow is never cut.
+func TestHTTP2Pings(t *testing.T) {
+	savedIdle, savedInterval, savedTimeout := idleTimeout, h2PingInterval, h2PingTimeout
+	idleTimeout, h2PingInterval, h2PingTimeout = 10*time.Second, 200*time.Millisecond, 200*time.Millisecond
+	t.Cleanup(func() { idleTimeout, h2PingInterval, h2PingTimeout = savedIdle, savedInterval, savedTimeout })
+
+	t.Run("dead peer", func(t *testing.T) {
+		// The server completes the TLS and HTTP/2 handshakes, then goes silent.
+		srv, client := h2Server(t, nil, func(_ *http.Server, c *tls.Conn, _ http.Handler) {
+			_, _ = c.Write([]byte{0, 0, 0, 0x4, 0, 0, 0, 0, 0}) // an empty SETTINGS frame
+			_, _ = io.Copy(io.Discard, c)
+		})
+
+		start := time.Now()
+		_, err := client.Get(srv.URL)
+		require.ErrorContains(t, err, "http2: client connection lost")
+		require.Less(t, time.Since(start), 5*time.Second)
+		require.True(t, gcs.ShouldRetry(err))
+	})
+
+	t.Run("slow peer", func(t *testing.T) {
+		srv, client := h2Server(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = io.Copy(w, &trickle{n: 10, flush: w.(http.Flusher)})
+		}), nil)
+
+		resp, err := client.Get(srv.URL)
+		require.NoError(t, err)
+		defer resp.Body.Close()
+		require.Equal(t, 2, resp.ProtoMajor)
+		body, err := io.ReadAll(resp.Body)
+		require.NoError(t, err)
+		require.Len(t, body, 10)
+	})
+}
+
+// h2Server is a TLS server speaking HTTP/2, and a client trusting it whose
+// transport has this package's timeouts. A takeover, if given, owns each
+// connection in place of the HTTP/2 server.
+func h2Server(t *testing.T, h http.Handler, takeover func(*http.Server, *tls.Conn, http.Handler)) (*httptest.Server, *http.Client) {
+	srv := httptest.NewUnstartedServer(h)
+	srv.EnableHTTP2 = true
+	if takeover != nil {
+		srv.Config.TLSNextProto = map[string]func(*http.Server, *tls.Conn, http.Handler){"h2": takeover}
+	}
+	srv.StartTLS()
+	t.Cleanup(srv.Close)
+	client := &http.Client{Transport: transportWithTimeouts(srv.Client().Transport)}
+	return srv, client
+}
 
 // A connection is cut when no bytes move for idleTimeout, and never while a
 // slow transfer is still moving them.
