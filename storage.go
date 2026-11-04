@@ -181,9 +181,11 @@ func deleteError(failed map[string]error) error {
 // can take minutes to answer a large commit.
 var idleTimeout = 5 * time.Minute
 
-// An HTTP/2 connection with no frame for h2PingInterval is pinged, and dropped
-// when the ping goes unanswered for h2PingTimeout. Every request on it then
-// fails with "client connection lost", which the SDKs retry.
+// An HTTP/2 connection with no inbound frame for h2PingInterval is pinged, and
+// dropped when the ping goes unanswered for h2PingTimeout. Every request on it
+// then fails with "client connection lost", which the SDKs retry. The ping
+// waits behind the frame being written, so a peer accepting less than one
+// frame (16 KiB) per h2PingTimeout is dropped too.
 var (
 	h2PingInterval = 30 * time.Second
 	h2PingTimeout  = 15 * time.Second
