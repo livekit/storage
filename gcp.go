@@ -120,7 +120,23 @@ func NewGCP(conf *GCPConfig) (Storage, error) {
 	if u.client, err = storage.NewClient(ctx, opts...); err != nil {
 		return nil, err
 	}
+	u.client.SetRetry(storage.WithErrorFunc(gcsShouldRetry))
 	return u, nil
+}
+
+// gcsShouldRetry is the SDK's predicate plus the errors with which Go's HTTP/2
+// client ends every request on a connection it is closing. Such a request may
+// have been received, which an overwrite or a precondition tolerates.
+func gcsShouldRetry(err error) bool {
+	if err == nil {
+		return false
+	}
+	if storage.ShouldRetry(err) {
+		return true
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "http2: client connection force closed") ||
+		strings.Contains(msg, "http2: server sent GOAWAY and closed the connection")
 }
 
 func (s *gcpStorage) UploadFile(ctx context.Context, storagePath, filepath string, opts PutOptions) (string, int64, error) {

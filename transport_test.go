@@ -17,10 +17,12 @@ package storage
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"testing"
 	"time"
@@ -28,6 +30,52 @@ import (
 	gcs "cloud.google.com/go/storage"
 	"github.com/stretchr/testify/require"
 )
+
+// The errors with which Go's HTTP/2 client ends every request on a connection
+// it is closing are retried on GCS, where the SDK's own predicate leaves them.
+func TestGCSRetriesConnectionClose(t *testing.T) {
+	t.Run("server GOAWAY", func(t *testing.T) {
+		// The server completes the handshake, takes the request's HEADERS,
+		// then says goodbye with the request's stream still open and closes.
+		srv, client := h2Server(t, nil, func(_ *http.Server, c *tls.Conn, _ http.Handler) {
+			_, _ = c.Write([]byte{0, 0, 0, 0x4, 0, 0, 0, 0, 0}) // an empty SETTINGS frame
+			_, _ = io.ReadFull(c, make([]byte, 24))          // the client preface
+			hdr := make([]byte, 9)
+			for {
+				if _, err := io.ReadFull(c, hdr); err != nil {
+					return
+				}
+				payload := make([]byte, int(hdr[0])<<16|int(hdr[1])<<8|int(hdr[2]))
+				if _, err := io.ReadFull(c, payload); err != nil {
+					return
+				}
+				if hdr[3] == 0x1 { // HEADERS
+					break
+				}
+			}
+			// GOAWAY: last stream 1, NO_ERROR.
+			_, _ = c.Write([]byte{0, 0, 8, 0x7, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0})
+		})
+
+		_, err := client.Get(srv.URL)
+		require.ErrorContains(t, err, "http2: server sent GOAWAY and closed the connection")
+		require.False(t, gcs.ShouldRetry(err), "the SDK's predicate, which this package adds to")
+		require.True(t, gcsShouldRetry(err))
+	})
+
+	t.Run("client force closed", func(t *testing.T) {
+		err := &url.Error{Op: "Post", URL: "https://storage.googleapis.com/upload/storage/v1/b/bucket/o",
+			Err: errors.New("http2: client connection force closed via ClientConn.Close")}
+		require.False(t, gcs.ShouldRetry(err))
+		require.True(t, gcsShouldRetry(err))
+	})
+
+	t.Run("unchanged otherwise", func(t *testing.T) {
+		require.False(t, gcsShouldRetry(nil))
+		require.False(t, gcsShouldRetry(gcs.ErrObjectNotExist))
+		require.True(t, gcsShouldRetry(&url.Error{Op: "Post", URL: "https://storage.googleapis.com", Err: errors.New("read: connection reset by peer")}))
+	})
+}
 
 // A dead HTTP/2 peer, one that keeps the connection open but answers nothing,
 // not even pings, fails the request well before the idle timeout, with an
