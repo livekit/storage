@@ -15,13 +15,23 @@
 package storage
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/pem"
+	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"net/url"
+	"slices"
+	"sync/atomic"
+	"syscall"
 	"testing"
 
+	"github.com/oracle/oci-go-sdk/v65/common"
+	"github.com/oracle/oci-go-sdk/v65/objectstorage"
 	"github.com/stretchr/testify/require"
 )
 
@@ -89,4 +99,161 @@ func TestOCILocationHost(t *testing.T) {
 	u, err := url.Parse(s.(*ociStorage).location("a/b.mp4"))
 	require.NoError(t, err)
 	require.Equal(t, "objectstorage.us-chicago-1.oraclecloud.com", u.Host)
+}
+
+// ociTestConfig is API key credentials for endpoint. A set Namespace keeps
+// NewOCI off the network.
+func ociTestConfig(t *testing.T, endpoint string) *OCIConfig {
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	require.NoError(t, err)
+	pemKey := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
+	return &OCIConfig{
+		TenancyOCID: "ocid1.tenancy.oc1..tenancy",
+		UserOCID:    "ocid1.user.oc1..user",
+		Fingerprint: "aa:bb:cc",
+		PrivateKey:  string(pemKey),
+		Region:      "us-chicago-1",
+		Namespace:   "ns",
+		Bucket:      "bucket",
+		Endpoint:    endpoint,
+	}
+}
+
+// A request whose connection the server closes before answering is sent
+// again, where the SDK's own predicate leaves it failed.
+func TestOCIRetriesClosedConnection(t *testing.T) {
+	t.Run("upload", func(t *testing.T) {
+		// Without the header the server writes nothing before it closes, so
+		// the client reads a bare EOF.
+		t.Setenv(common.UsingExpectHeaderEnvVar, "false")
+
+		var requests atomic.Int32
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = io.Copy(io.Discard, r.Body)
+			if requests.Add(1) > 1 {
+				return
+			}
+			if c, _, err := w.(http.Hijacker).Hijack(); err == nil {
+				_ = c.Close()
+			}
+		}))
+		t.Cleanup(srv.Close)
+
+		s, err := NewOCI(ociTestConfig(t, srv.URL))
+		require.NoError(t, err)
+		require.NoError(t, s.PutObject(context.Background(), "k", []byte("hello"), PutOptions{}))
+		require.EqualValues(t, 2, requests.Load())
+	})
+
+	put := func(err error) common.OCIOperationResponse {
+		return common.OCIOperationResponse{
+			Error: &url.Error{Op: "Put", URL: "https://objectstorage.us-chicago-1.oraclecloud.com/n/ns/b/bucket/o/k", Err: err},
+		}
+	}
+
+	t.Run("errors of a closed connection", func(t *testing.T) {
+		for _, err := range []error{
+			io.EOF,
+			io.ErrUnexpectedEOF,
+			errors.New("http: server closed idle connection"),
+		} {
+			r := put(err)
+			require.False(t, common.DefaultShouldRetryOperation(r), "the SDK's predicate, which this package adds to: %v", err)
+			require.True(t, ociShouldRetry(r), "%v", err)
+		}
+	})
+
+	t.Run("unchanged otherwise", func(t *testing.T) {
+		require.True(t, ociShouldRetry(put(syscall.ECONNRESET)))
+		require.False(t, ociShouldRetry(put(errors.New("x509: certificate signed by unknown authority"))))
+		require.False(t, ociShouldRetry(common.OCIOperationResponse{Error: &ociServiceError{status: http.StatusNotFound}}))
+	})
+}
+
+// flakyTokenProvider fails its token-backed calls with failures, in turn, then
+// serves them as the API key provider it wraps.
+type flakyTokenProvider struct {
+	common.ConfigurationProvider
+	failures []error
+	fetches  int
+}
+
+func (p *flakyTokenProvider) fetch() error {
+	p.fetches++
+	if len(p.failures) == 0 {
+		return nil
+	}
+	err := p.failures[0]
+	p.failures = p.failures[1:]
+	return err
+}
+
+func (p *flakyTokenProvider) TenancyOCID() (string, error) {
+	if err := p.fetch(); err != nil {
+		return "", err
+	}
+	return p.ConfigurationProvider.TenancyOCID()
+}
+
+func (p *flakyTokenProvider) KeyID() (string, error) {
+	if err := p.fetch(); err != nil {
+		return "", err
+	}
+	return p.ConfigurationProvider.KeyID()
+}
+
+func (p *flakyTokenProvider) PrivateRSAKey() (*rsa.PrivateKey, error) {
+	if err := p.fetch(); err != nil {
+		return nil, err
+	}
+	return p.ConfigurationProvider.PrivateRSAKey()
+}
+
+func (p *flakyTokenProvider) GetClaim(string) (interface{}, error) {
+	return nil, p.fetch()
+}
+
+func (p *flakyTokenProvider) Refreshable() bool { return true }
+
+// A workload identity token fetch that is throttled is made again, so a client
+// is built where the SDK alone fails on the first refusal.
+func TestOCIRetriesTokenFetch(t *testing.T) {
+	backoff := ociTokenBackoff
+	ociTokenBackoff = 0
+	t.Cleanup(func() { ociTokenBackoff = backoff })
+
+	// The SDK's errors, which carry the response's status only as text.
+	throttled := errors.New("failed to renew security token: failed to get security token: failed to get a Workload Identity token. Status: 429 Too Many Requests, Message: . Please contact OKE team")
+	forbidden := errors.New("failed to renew security token: failed to get security token: please ensure the cluster type is enhanced: Status: 403 Forbidden, Message: ")
+
+	flaky := func(failures ...error) *flakyTokenProvider {
+		keys, err := newConfigProvider(ociTestConfig(t, ""))
+		require.NoError(t, err)
+		return &flakyTokenProvider{ConfigurationProvider: keys, failures: failures}
+	}
+
+	t.Run("a client is built over throttled fetches", func(t *testing.T) {
+		_, err := objectstorage.NewObjectStorageClientWithConfigurationProvider(flaky(throttled))
+		require.Error(t, err, "the SDK's one fetch, which this package repeats")
+
+		p := flaky(throttled, throttled)
+		client, err := objectstorage.NewObjectStorageClientWithConfigurationProvider(ociTokenProvider{p})
+		require.NoError(t, err)
+		require.Empty(t, p.failures)
+		require.True(t, client.IsRefreshableAuthType())
+	})
+
+	t.Run("gives up after its attempts", func(t *testing.T) {
+		p := flaky(slices.Repeat([]error{throttled}, ociTokenAttempts+1)...)
+		_, err := ociTokenProvider{p}.KeyID()
+		require.ErrorIs(t, err, throttled)
+		require.Equal(t, ociTokenAttempts, p.fetches)
+	})
+
+	t.Run("a cluster without workload identity fails at once", func(t *testing.T) {
+		p := flaky(forbidden, forbidden)
+		_, err := ociTokenProvider{p}.GetClaim("res_tenant")
+		require.ErrorIs(t, err, forbidden)
+		require.Equal(t, 1, p.fetches)
+	})
 }

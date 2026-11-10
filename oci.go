@@ -17,10 +17,12 @@ package storage
 import (
 	"bytes"
 	"context"
+	"crypto/rsa"
 	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net/http"
 	"net/url"
 	"os"
@@ -80,6 +82,8 @@ func NewOCI(conf *OCIConfig) (Storage, error) {
 		}
 		client.HTTPClient = c
 	}
+	policy := ociRetryPolicy()
+	client.Configuration.RetryPolicy = &policy
 
 	// client.Host keeps endpoint options such as {dualStack?ds.oci.:}, which the
 	// SDK resolves on a copy per request, so resolve them the same way here.
@@ -135,9 +139,97 @@ func lookupNamespace(client objectstorage.ObjectStorageClient, req objectstorage
 	}
 }
 
+// ociRetryPolicy is the SDK's default policy with ociShouldRetry as its
+// predicate. The eventual-consistency default swaps a set predicate out.
+func ociRetryPolicy() common.RetryPolicy {
+	policy := common.DefaultRetryPolicyWithoutEventualConsistency()
+	policy.ShouldRetryOperation = ociShouldRetry
+	return policy
+}
+
+// ociShouldRetry is the SDK's predicate plus a connection the server closed
+// under the request, which the SDK matches only when nothing wraps the error.
+// Such a request may have been received, as with a timeout the SDK retries.
+func ociShouldRetry(r common.OCIOperationResponse) bool {
+	if common.DefaultShouldRetryOperation(r) {
+		return true
+	}
+	err := r.Error
+	if err == nil {
+		return false
+	}
+	return errors.Is(err, io.EOF) ||
+		errors.Is(err, io.ErrUnexpectedEOF) ||
+		strings.Contains(err.Error(), "http: server closed idle connection")
+}
+
+const (
+	ociTokenAttempts = 5
+	// A fetch that fails this long after the first began has timed out, and
+	// is not repeated.
+	ociTokenRetryWindow = 15 * time.Second
+)
+
+// ociTokenBackoff is the wait before the first retry of a token fetch. Each
+// later wait doubles it, and each is jittered.
+var ociTokenBackoff = 250 * time.Millisecond
+
+// ociTokenProvider retries the workload identity token fetch, which the SDK
+// makes once, inside whichever of these calls finds no valid token.
+type ociTokenProvider struct {
+	auth.ConfigurationProviderWithClaimAccess
+}
+
+func (p ociTokenProvider) TenancyOCID() (string, error) {
+	return retryOCIToken(p.ConfigurationProviderWithClaimAccess.TenancyOCID)
+}
+
+func (p ociTokenProvider) KeyID() (string, error) {
+	return retryOCIToken(p.ConfigurationProviderWithClaimAccess.KeyID)
+}
+
+func (p ociTokenProvider) PrivateRSAKey() (*rsa.PrivateKey, error) {
+	return retryOCIToken(p.ConfigurationProviderWithClaimAccess.PrivateRSAKey)
+}
+
+func (p ociTokenProvider) GetClaim(key string) (interface{}, error) {
+	return retryOCIToken(func() (interface{}, error) {
+		return p.ConfigurationProviderWithClaimAccess.GetClaim(key)
+	})
+}
+
+// Refreshable keeps the SDK's retry of a 401 on a token it can renew.
+func (p ociTokenProvider) Refreshable() bool {
+	r, ok := p.ConfigurationProviderWithClaimAccess.(common.RefreshableConfigurationProvider)
+	return ok && r.Refreshable()
+}
+
+func retryOCIToken[T any](fetch func() (T, error)) (T, error) {
+	start := time.Now()
+	backoff := ociTokenBackoff
+	for attempt := 1; ; attempt++ {
+		v, err := fetch()
+		if err == nil || attempt == ociTokenAttempts || !ociTokenRetryable(err) || time.Since(start) > ociTokenRetryWindow {
+			return v, err
+		}
+		time.Sleep(backoff/2 + rand.N(backoff/2+1))
+		backoff *= 2
+	}
+}
+
+// ociTokenRetryable is any failure but the 403 of a cluster without workload
+// identity. The SDK flattens the response's status into the error's text.
+func ociTokenRetryable(err error) bool {
+	return !strings.Contains(err.Error(), "Status: 403")
+}
+
 func newConfigProvider(conf *OCIConfig) (common.ConfigurationProvider, error) {
 	if conf.UseWorkloadIdentity {
-		return auth.OkeWorkloadIdentityConfigurationProvider()
+		provider, err := auth.OkeWorkloadIdentityConfigurationProvider()
+		if err != nil {
+			return nil, err
+		}
+		return ociTokenProvider{provider}, nil
 	}
 
 	if conf.TenancyOCID != "" && conf.UserOCID != "" && conf.PrivateKey != "" {
