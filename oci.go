@@ -29,6 +29,8 @@ import (
 	"path"
 	"slices"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/oracle/oci-go-sdk/v65/common"
@@ -37,7 +39,13 @@ import (
 )
 
 type ociStorage struct {
-	conf      *OCIConfig
+	conf     *OCIConfig
+	provider common.ConfigurationProvider
+
+	// connected is set once the fields below are, by connect under mu.
+	connected atomic.Bool
+	mu        sync.Mutex
+	built     bool
 	client    objectstorage.ObjectStorageClient
 	namespace string
 	host      string
@@ -45,15 +53,75 @@ type ociStorage struct {
 	insecure bool
 }
 
+// NewOCI makes no request. With workload identity the SDK fetches a token as
+// its client is built, so the first call builds it. A namespace the config
+// leaves out is looked up by the first call as well.
 func NewOCI(conf *OCIConfig) (Storage, error) {
 	provider, err := newConfigProvider(conf)
 	if err != nil {
 		return nil, err
 	}
 
-	client, err := objectstorage.NewObjectStorageClientWithConfigurationProvider(provider)
+	s := &ociStorage{conf: conf, provider: provider, namespace: conf.Namespace}
+	if !conf.UseWorkloadIdentity {
+		if err = s.build(); err != nil {
+			return nil, err
+		}
+		s.connected.Store(s.namespace != "")
+	}
+	return s, nil
+}
+
+// ready has the client built and the namespace known, by this call where no
+// earlier one did. A failure is not kept, so the next call tries again. A call
+// whose ctx ends is released, and the work goes on for the next one.
+func (s *ociStorage) ready(ctx context.Context) error {
+	if s.connected.Load() {
+		return nil
+	}
+	done := make(chan error, 1)
+	go func() { done <- s.connect() }()
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (s *ociStorage) connect() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.connected.Load() {
+		return nil
+	}
+
+	if !s.built {
+		if err := s.build(); err != nil {
+			return err
+		}
+	}
+	if s.namespace == "" {
+		req := objectstorage.GetNamespaceRequest{}
+		if s.conf.CompartmentID != "" {
+			req.CompartmentId = &s.conf.CompartmentID
+		}
+		namespace, err := lookupNamespace(s.client, req)
+		if err != nil {
+			return err
+		}
+		s.namespace = namespace
+	}
+	s.connected.Store(true)
+	return nil
+}
+
+// build makes the SDK client, which with workload identity fetches a token.
+func (s *ociStorage) build() error {
+	conf := s.conf
+	client, err := objectstorage.NewObjectStorageClientWithConfigurationProvider(s.provider)
 	if err != nil {
-		return nil, err
+		return err
 	}
 
 	if conf.Region != "" {
@@ -93,25 +161,8 @@ func NewOCI(conf *OCIConfig) (Storage, error) {
 	insecure := strings.HasPrefix(host, "http://")
 	host = strings.TrimPrefix(host, "http://")
 
-	s := &ociStorage{
-		conf:      conf,
-		client:    client,
-		namespace: conf.Namespace,
-		host:      host,
-		insecure:  insecure,
-	}
-
-	if s.namespace == "" {
-		req := objectstorage.GetNamespaceRequest{}
-		if conf.CompartmentID != "" {
-			req.CompartmentId = &conf.CompartmentID
-		}
-		if s.namespace, err = lookupNamespace(client, req); err != nil {
-			return nil, err
-		}
-	}
-
-	return s, nil
+	s.client, s.host, s.insecure, s.built = client, host, insecure, true
+	return nil
 }
 
 // lookupNamespace is the tenancy's namespace, or an error after a minute, as
@@ -293,6 +344,9 @@ func (s *ociStorage) DownloadFile(ctx context.Context, storagePath, filepath str
 // costs an API call to mint, and it needs PAR_MANAGE on the bucket. Its access
 // URI is returned only here and cannot be read back afterwards.
 func (s *ociStorage) PresignedURL(ctx context.Context, storagePath string, expiration time.Duration) (string, error) {
+	if err := s.ready(ctx); err != nil {
+		return "", err
+	}
 	name := fmt.Sprintf("livekit-storage-%s-%d", storagePath, time.Now().UnixNano())
 	expires := common.SDKTime{Time: time.Now().Add(expiration)}
 
@@ -341,6 +395,9 @@ var ociContentDisposition = common.String("inline")
 // put sends body in one request. It must be seekable, so the SDK can re-read
 // it when it retries.
 func (s *ociStorage) put(ctx context.Context, storagePath string, body io.ReadCloser, size int64, opts PutOptions) error {
+	if err := s.ready(ctx); err != nil {
+		return err
+	}
 	req := objectstorage.PutObjectRequest{
 		NamespaceName:      &s.namespace,
 		BucketName:         &s.conf.Bucket,
@@ -363,6 +420,9 @@ func (s *ociStorage) put(ctx context.Context, storagePath string, body io.ReadCl
 // multipart upload of sequential parts through one buffer. IfAbsent is checked
 // at create and again at commit, so it is atomic here.
 func (s *ociStorage) UploadObject(ctx context.Context, storagePath string, body io.Reader, opts PutOptions) error {
+	if err := s.ready(ctx); err != nil {
+		return err
+	}
 	// The condition is checked again at create and commit; this check spares a
 	// refused upload its traffic, and refuses it where a store ignores
 	// if-none-match on multipart uploads, as floci-oci does.
@@ -492,6 +552,9 @@ func (s *ociStorage) DownloadObject(ctx context.Context, storagePath string, w i
 }
 
 func (s *ociStorage) download(ctx context.Context, storagePath string, w io.Writer, rng *string) (int64, error) {
+	if err := s.ready(ctx); err != nil {
+		return 0, err
+	}
 	resp, err := s.client.GetObject(ctx, objectstorage.GetObjectRequest{
 		NamespaceName: &s.namespace,
 		BucketName:    &s.conf.Bucket,
@@ -507,6 +570,9 @@ func (s *ociStorage) download(ctx context.Context, storagePath string, w io.Writ
 }
 
 func (s *ociStorage) ObjectExists(ctx context.Context, storagePath string) (bool, error) {
+	if err := s.ready(ctx); err != nil {
+		return false, err
+	}
 	_, err := s.client.HeadObject(ctx, objectstorage.HeadObjectRequest{
 		NamespaceName: &s.namespace,
 		BucketName:    &s.conf.Bucket,
@@ -520,6 +586,9 @@ func (s *ociStorage) ObjectExists(ctx context.Context, storagePath string) (bool
 }
 
 func (s *ociStorage) ListObjects(ctx context.Context, prefix string) ([]string, error) {
+	if err := s.ready(ctx); err != nil {
+		return nil, err
+	}
 	var keys []string
 	var start *string
 	for {
@@ -545,6 +614,9 @@ func (s *ociStorage) ListObjects(ctx context.Context, prefix string) ([]string, 
 
 func (s *ociStorage) DeleteObjects(ctx context.Context, storagePaths []string) error {
 	return deleteEach(ctx, storagePaths, func(ctx context.Context, p string) error {
+		if err := s.ready(ctx); err != nil {
+			return err
+		}
 		_, err := s.client.DeleteObject(ctx, objectstorage.DeleteObjectRequest{
 			NamespaceName: &s.namespace,
 			BucketName:    &s.conf.Bucket,

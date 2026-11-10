@@ -26,9 +26,12 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"slices"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/oracle/oci-go-sdk/v65/common"
 	"github.com/oracle/oci-go-sdk/v65/objectstorage"
@@ -176,9 +179,20 @@ type flakyTokenProvider struct {
 	common.ConfigurationProvider
 	failures []error
 	fetches  int
+	// gate, when set, holds every fetch until it is closed.
+	gate chan struct{}
+}
+
+func flakyProvider(t *testing.T, failures ...error) *flakyTokenProvider {
+	keys, err := newConfigProvider(ociTestConfig(t, ""))
+	require.NoError(t, err)
+	return &flakyTokenProvider{ConfigurationProvider: keys, failures: failures}
 }
 
 func (p *flakyTokenProvider) fetch() error {
+	if p.gate != nil {
+		<-p.gate
+	}
 	p.fetches++
 	if len(p.failures) == 0 {
 		return nil
@@ -215,28 +229,29 @@ func (p *flakyTokenProvider) GetClaim(string) (interface{}, error) {
 
 func (p *flakyTokenProvider) Refreshable() bool { return true }
 
-// A workload identity token fetch that is throttled is made again, so a client
-// is built where the SDK alone fails on the first refusal.
-func TestOCIRetriesTokenFetch(t *testing.T) {
+// The SDK's token fetch errors, which carry the response's status only as text.
+var (
+	errOCIThrottled = errors.New("failed to renew security token: failed to get security token: failed to get a Workload Identity token. Status: 429 Too Many Requests, Message: . Please contact OKE team")
+	errOCIForbidden = errors.New("failed to renew security token: failed to get security token: please ensure the cluster type is enhanced: Status: 403 Forbidden, Message: ")
+)
+
+// noOCITokenBackoff has a token fetch retried at once.
+func noOCITokenBackoff(t *testing.T) {
 	backoff := ociTokenBackoff
 	ociTokenBackoff = 0
 	t.Cleanup(func() { ociTokenBackoff = backoff })
+}
 
-	// The SDK's errors, which carry the response's status only as text.
-	throttled := errors.New("failed to renew security token: failed to get security token: failed to get a Workload Identity token. Status: 429 Too Many Requests, Message: . Please contact OKE team")
-	forbidden := errors.New("failed to renew security token: failed to get security token: please ensure the cluster type is enhanced: Status: 403 Forbidden, Message: ")
-
-	flaky := func(failures ...error) *flakyTokenProvider {
-		keys, err := newConfigProvider(ociTestConfig(t, ""))
-		require.NoError(t, err)
-		return &flakyTokenProvider{ConfigurationProvider: keys, failures: failures}
-	}
+// A workload identity token fetch that is throttled is made again, so a client
+// is built where the SDK alone fails on the first refusal.
+func TestOCIRetriesTokenFetch(t *testing.T) {
+	noOCITokenBackoff(t)
 
 	t.Run("a client is built over throttled fetches", func(t *testing.T) {
-		_, err := objectstorage.NewObjectStorageClientWithConfigurationProvider(flaky(throttled))
+		_, err := objectstorage.NewObjectStorageClientWithConfigurationProvider(flakyProvider(t, errOCIThrottled))
 		require.Error(t, err, "the SDK's one fetch, which this package repeats")
 
-		p := flaky(throttled, throttled)
+		p := flakyProvider(t, errOCIThrottled, errOCIThrottled)
 		client, err := objectstorage.NewObjectStorageClientWithConfigurationProvider(ociTokenProvider{p})
 		require.NoError(t, err)
 		require.Empty(t, p.failures)
@@ -244,16 +259,97 @@ func TestOCIRetriesTokenFetch(t *testing.T) {
 	})
 
 	t.Run("gives up after its attempts", func(t *testing.T) {
-		p := flaky(slices.Repeat([]error{throttled}, ociTokenAttempts+1)...)
+		p := flakyProvider(t, slices.Repeat([]error{errOCIThrottled}, ociTokenAttempts+1)...)
 		_, err := ociTokenProvider{p}.KeyID()
-		require.ErrorIs(t, err, throttled)
+		require.ErrorIs(t, err, errOCIThrottled)
 		require.Equal(t, ociTokenAttempts, p.fetches)
 	})
 
 	t.Run("a cluster without workload identity fails at once", func(t *testing.T) {
-		p := flaky(forbidden, forbidden)
+		p := flakyProvider(t, errOCIForbidden, errOCIForbidden)
 		_, err := ociTokenProvider{p}.GetClaim("res_tenant")
-		require.ErrorIs(t, err, forbidden)
+		require.ErrorIs(t, err, errOCIForbidden)
 		require.Equal(t, 1, p.fetches)
 	})
+}
+
+// With workload identity the first call builds the client, not NewOCI: a
+// build that fails is that call's failure, and the next call builds again.
+func TestOCIBuildsClientOnFirstCall(t *testing.T) {
+	noOCITokenBackoff(t)
+
+	var requests atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		requests.Add(1)
+	}))
+	t.Cleanup(srv.Close)
+
+	// The store NewOCI makes with workload identity, over provider.
+	lazy := func(provider *flakyTokenProvider) *ociStorage {
+		conf := ociTestConfig(t, srv.URL)
+		return &ociStorage{conf: conf, provider: ociTokenProvider{provider}, namespace: conf.Namespace}
+	}
+	ctx := context.Background()
+
+	t.Run("a failed build is tried again", func(t *testing.T) {
+		requests.Store(0)
+		s := lazy(flakyProvider(t, slices.Repeat([]error{errOCIThrottled}, ociTokenAttempts)...))
+
+		err := s.PutObject(ctx, "k", []byte("hello"), PutOptions{})
+		require.ErrorContains(t, err, "429 Too Many Requests")
+		require.Zero(t, requests.Load())
+
+		require.NoError(t, s.PutObject(ctx, "k", []byte("hello"), PutOptions{}))
+		require.EqualValues(t, 1, requests.Load())
+	})
+
+	t.Run("a call is released when its context ends", func(t *testing.T) {
+		requests.Store(0)
+		provider := flakyProvider(t)
+		provider.gate = make(chan struct{})
+		s := lazy(provider)
+
+		short, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
+		defer cancel()
+		require.ErrorIs(t, s.PutObject(short, "k", []byte("hello"), PutOptions{}), context.DeadlineExceeded)
+
+		// The build the first call began goes on, and serves the next.
+		close(provider.gate)
+		require.NoError(t, s.PutObject(ctx, "k", []byte("hello"), PutOptions{}))
+		require.EqualValues(t, 1, requests.Load())
+	})
+}
+
+// A namespace the config leaves out is looked up by the first call, so NewOCI
+// makes no request.
+func TestOCILooksUpNamespaceOnFirstCall(t *testing.T) {
+	var mu sync.Mutex
+	var seen []string
+	requests := func() []string {
+		mu.Lock()
+		defer mu.Unlock()
+		return slices.Clone(seen)
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		path := strings.TrimSuffix(r.URL.Path, "/")
+		mu.Lock()
+		seen = append(seen, r.Method+" "+path)
+		mu.Unlock()
+		if path == "/n" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `"ns"`)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	conf := ociTestConfig(t, srv.URL)
+	conf.Namespace = ""
+	s, err := NewOCI(conf)
+	require.NoError(t, err)
+	require.Empty(t, requests())
+
+	require.NoError(t, s.PutObject(context.Background(), "k", []byte("hello"), PutOptions{}))
+	require.Equal(t, []string{"GET /n", "PUT /n/ns/b/bucket/o/k"}, requests())
 }
