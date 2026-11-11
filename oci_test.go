@@ -26,6 +26,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -162,14 +163,15 @@ func TestOCIRetriesClosedConnection(t *testing.T) {
 		} {
 			r := put(err)
 			require.False(t, common.DefaultShouldRetryOperation(r), "the SDK's predicate, which this package adds to: %v", err)
-			require.True(t, ociShouldRetry(r), "%v", err)
+			require.True(t, ociAlsoClosed(common.DefaultShouldRetryOperation)(r), "%v", err)
 		}
 	})
 
 	t.Run("unchanged otherwise", func(t *testing.T) {
-		require.True(t, ociShouldRetry(put(syscall.ECONNRESET)))
-		require.False(t, ociShouldRetry(put(errors.New("x509: certificate signed by unknown authority"))))
-		require.False(t, ociShouldRetry(common.OCIOperationResponse{Error: &ociServiceError{status: http.StatusNotFound}}))
+		retry := ociAlsoClosed(common.DefaultShouldRetryOperation)
+		require.True(t, retry(put(syscall.ECONNRESET)))
+		require.False(t, retry(put(errors.New("x509: certificate signed by unknown authority"))))
+		require.False(t, retry(common.OCIOperationResponse{Error: &ociServiceError{status: http.StatusNotFound}}))
 	})
 }
 
@@ -178,7 +180,7 @@ func TestOCIRetriesClosedConnection(t *testing.T) {
 type flakyTokenProvider struct {
 	common.ConfigurationProvider
 	failures []error
-	fetches  int
+	fetches  atomic.Int32
 	// gate, when set, holds every fetch until it is closed.
 	gate chan struct{}
 }
@@ -193,7 +195,7 @@ func (p *flakyTokenProvider) fetch() error {
 	if p.gate != nil {
 		<-p.gate
 	}
-	p.fetches++
+	p.fetches.Add(1)
 	if len(p.failures) == 0 {
 		return nil
 	}
@@ -262,14 +264,14 @@ func TestOCIRetriesTokenFetch(t *testing.T) {
 		p := flakyProvider(t, slices.Repeat([]error{errOCIThrottled}, ociTokenAttempts+1)...)
 		_, err := ociTokenProvider{p}.KeyID()
 		require.ErrorIs(t, err, errOCIThrottled)
-		require.Equal(t, ociTokenAttempts, p.fetches)
+		require.EqualValues(t, ociTokenAttempts, p.fetches.Load())
 	})
 
 	t.Run("a cluster without workload identity fails at once", func(t *testing.T) {
 		p := flakyProvider(t, errOCIForbidden, errOCIForbidden)
 		_, err := ociTokenProvider{p}.GetClaim("res_tenant")
 		require.ErrorIs(t, err, errOCIForbidden)
-		require.Equal(t, 1, p.fetches)
+		require.EqualValues(t, 1, p.fetches.Load())
 	})
 }
 
@@ -319,6 +321,45 @@ func TestOCIBuildsClientOnFirstCall(t *testing.T) {
 		require.NoError(t, s.PutObject(ctx, "k", []byte("hello"), PutOptions{}))
 		require.EqualValues(t, 1, requests.Load())
 	})
+
+	t.Run("a delete checks once for all its paths", func(t *testing.T) {
+		provider := flakyProvider(t, slices.Repeat([]error{errOCIThrottled}, 10*ociTokenAttempts)...)
+		s := lazy(provider)
+
+		paths := make([]string, 40)
+		for i := range paths {
+			paths[i] = strconv.Itoa(i)
+		}
+		var failed *DeleteError
+		require.ErrorAs(t, s.DeleteObjects(ctx, paths), &failed)
+		require.Len(t, failed.Failed, len(paths))
+		require.EqualValues(t, ociTokenAttempts, provider.fetches.Load())
+	})
+
+	t.Run("calls that leave start no build of their own", func(t *testing.T) {
+		provider := flakyProvider(t, slices.Repeat([]error{errOCIThrottled}, 10*ociTokenAttempts)...)
+		provider.gate = make(chan struct{})
+		s := lazy(provider)
+
+		errs := make([]error, 5)
+		var wg sync.WaitGroup
+		for i := range errs {
+			wg.Go(func() {
+				short, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
+				defer cancel()
+				errs[i] = s.PutObject(short, "k", []byte("hello"), PutOptions{})
+			})
+		}
+		wg.Wait()
+		for _, err := range errs {
+			require.ErrorIs(t, err, context.DeadlineExceeded)
+		}
+
+		// The one build they shared fails after its attempts, and none follows.
+		close(provider.gate)
+		require.Eventually(t, func() bool { return provider.fetches.Load() == ociTokenAttempts }, 5*time.Second, 5*time.Millisecond)
+		require.Never(t, func() bool { return provider.fetches.Load() > ociTokenAttempts }, 200*time.Millisecond, 10*time.Millisecond)
+	})
 }
 
 // A namespace the config leaves out is looked up by the first call, so NewOCI
@@ -352,4 +393,92 @@ func TestOCILooksUpNamespaceOnFirstCall(t *testing.T) {
 
 	require.NoError(t, s.PutObject(context.Background(), "k", []byte("hello"), PutOptions{}))
 	require.Equal(t, []string{"GET /n", "PUT /n/ns/b/bucket/o/k"}, requests())
+}
+
+// hangUp reads the request, then closes its connection with no answer.
+func hangUp(w http.ResponseWriter, r *http.Request) {
+	_, _ = io.Copy(io.Discard, r.Body)
+	if c, _, err := w.(http.Hijacker).Hijack(); err == nil {
+		_ = c.Close()
+	}
+}
+
+// The policy the SDK is configured with stays in effect: retries switched off
+// stay off, and a global policy keeps its attempts, with a closed connection
+// among what it retries.
+func TestOCIKeepsConfiguredRetries(t *testing.T) {
+	t.Setenv(common.UsingExpectHeaderEnvVar, "false")
+
+	var requests atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		hangUp(w, r)
+	}))
+	t.Cleanup(srv.Close)
+	ctx := context.Background()
+
+	t.Run("retries switched off", func(t *testing.T) {
+		t.Setenv("OCI_SDK_DEFAULT_RETRY_ENABLED", "false")
+		requests.Store(0)
+
+		s, err := NewOCI(ociTestConfig(t, srv.URL))
+		require.NoError(t, err)
+		require.ErrorIs(t, s.PutObject(ctx, "k", []byte("hello"), PutOptions{}), io.EOF)
+		require.EqualValues(t, 1, requests.Load())
+	})
+
+	t.Run("a global policy", func(t *testing.T) {
+		twice := common.NewRetryPolicy(2, common.DefaultShouldRetryOperation, func(common.OCIOperationResponse) time.Duration { return 0 })
+		common.GlobalRetry = &twice
+		t.Cleanup(func() { common.GlobalRetry = nil })
+		requests.Store(0)
+
+		s, err := NewOCI(ociTestConfig(t, srv.URL))
+		require.NoError(t, err)
+		require.ErrorIs(t, s.PutObject(ctx, "k", []byte("hello"), PutOptions{}), io.EOF)
+		require.EqualValues(t, 2, requests.Load())
+	})
+}
+
+// A pre-authenticated request that got no answer may have been created, so
+// it is not sent again; one the server refused is.
+func TestOCIPresignedURLRetriesOnlyAnswered(t *testing.T) {
+	var requests atomic.Int32
+	var answer atomic.Value // func(http.ResponseWriter, *http.Request, int32)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		answer.Load().(func(http.ResponseWriter, *http.Request, int32))(w, r, requests.Add(1))
+	}))
+	t.Cleanup(srv.Close)
+
+	s, err := NewOCI(ociTestConfig(t, srv.URL))
+	require.NoError(t, err)
+	ctx := context.Background()
+
+	t.Run("no answer", func(t *testing.T) {
+		requests.Store(0)
+		answer.Store(func(w http.ResponseWriter, r *http.Request, _ int32) { hangUp(w, r) })
+
+		_, err := s.PresignedURL(ctx, "k", time.Hour)
+		require.ErrorIs(t, err, io.EOF)
+		require.EqualValues(t, 1, requests.Load())
+	})
+
+	t.Run("refused, then created", func(t *testing.T) {
+		requests.Store(0)
+		answer.Store(func(w http.ResponseWriter, r *http.Request, n int32) {
+			_, _ = io.Copy(io.Discard, r.Body)
+			w.Header().Set("Content-Type", "application/json")
+			if n == 1 {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				_, _ = io.WriteString(w, `{"code":"ServiceUnavailable","message":"busy"}`)
+				return
+			}
+			_, _ = io.WriteString(w, `{"accessUri":"/p/token/n/ns/b/bucket/o/k"}`)
+		})
+
+		u, err := s.PresignedURL(ctx, "k", time.Hour)
+		require.NoError(t, err)
+		require.Equal(t, srv.URL+"/p/token/n/ns/b/bucket/o/k", u)
+		require.EqualValues(t, 2, requests.Load())
+	})
 }

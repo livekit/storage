@@ -29,26 +29,29 @@ import (
 	"path"
 	"slices"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/oracle/oci-go-sdk/v65/common"
 	"github.com/oracle/oci-go-sdk/v65/common/auth"
 	"github.com/oracle/oci-go-sdk/v65/objectstorage"
+	"golang.org/x/sync/singleflight"
 )
 
 type ociStorage struct {
 	conf     *OCIConfig
 	provider common.ConfigurationProvider
 
-	// connected is set once the fields below are, by connect under mu.
-	connected atomic.Bool
-	mu        sync.Mutex
-	built     bool
-	client    objectstorage.ObjectStorageClient
-	namespace string
-	host      string
+	// connected is set once the fields below are, by connect, which
+	// connecting runs one at a time.
+	connected  atomic.Bool
+	connecting singleflight.Group
+	built      bool
+	client     objectstorage.ObjectStorageClient
+	// grantRetry is the policy of a call that leaves a grant behind.
+	grantRetry common.RetryPolicy
+	namespace  string
+	host       string
 	// insecure is an http:// Endpoint, such as an emulator's.
 	insecure bool
 }
@@ -72,26 +75,24 @@ func NewOCI(conf *OCIConfig) (Storage, error) {
 	return s, nil
 }
 
-// ready has the client built and the namespace known, by this call where no
-// earlier one did. A failure is not kept, so the next call tries again. A call
-// whose ctx ends is released, and the work goes on for the next one.
+// ready has the client built and the namespace known. The calls waiting on
+// that share one connect, and a failure is not kept, so a later call starts
+// another. A call whose ctx ends is released and leaves nothing running of its
+// own: the connect goes on for the calls still waiting, and for the next.
 func (s *ociStorage) ready(ctx context.Context) error {
 	if s.connected.Load() {
 		return nil
 	}
-	done := make(chan error, 1)
-	go func() { done <- s.connect() }()
+	done := s.connecting.DoChan("", func() (any, error) { return nil, s.connect() })
 	select {
-	case err := <-done:
-		return err
+	case r := <-done:
+		return r.Err
 	case <-ctx.Done():
 		return ctx.Err()
 	}
 }
 
 func (s *ociStorage) connect() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.connected.Load() {
 		return nil
 	}
@@ -150,7 +151,9 @@ func (s *ociStorage) build() error {
 		}
 		client.HTTPClient = c
 	}
-	policy := ociRetryPolicy()
+	// The SDK has set the policy the environment or common.GlobalRetry asks for.
+	configured := client.Configuration.RetryPolicy
+	policy := ociRetryPolicy(configured, ociAlsoClosed)
 	client.Configuration.RetryPolicy = &policy
 
 	// client.Host keeps endpoint options such as {dualStack?ds.oci.:}, which the
@@ -162,6 +165,7 @@ func (s *ociStorage) build() error {
 	host = strings.TrimPrefix(host, "http://")
 
 	s.client, s.host, s.insecure, s.built = client, host, insecure, true
+	s.grantRetry = ociRetryPolicy(configured, ociOnlyAnswered)
 	return nil
 }
 
@@ -190,28 +194,52 @@ func lookupNamespace(client objectstorage.ObjectStorageClient, req objectstorage
 	}
 }
 
-// ociRetryPolicy is the SDK's default policy with ociShouldRetry as its
-// predicate. The eventual-consistency default swaps a set predicate out.
-func ociRetryPolicy() common.RetryPolicy {
-	policy := common.DefaultRetryPolicyWithoutEventualConsistency()
-	policy.ShouldRetryOperation = ociShouldRetry
+type ociPredicate = func(common.OCIOperationResponse) bool
+
+// ociRetryPolicy is the policy in effect, configured or else the SDK's
+// default, with its predicate changed by change: its attempts and backoff stay.
+// The SDK runs the inner policy outside an eventual-consistency window, so
+// the predicates of both change.
+func ociRetryPolicy(configured *common.RetryPolicy, change func(ociPredicate) ociPredicate) common.RetryPolicy {
+	policy := common.DefaultRetryPolicy()
+	if configured != nil {
+		policy = *configured
+	}
+	policy.ShouldRetryOperation = change(policy.ShouldRetryOperation)
+	if policy.NonEventuallyConsistentPolicy != nil {
+		inner := *policy.NonEventuallyConsistentPolicy
+		inner.ShouldRetryOperation = change(inner.ShouldRetryOperation)
+		policy.NonEventuallyConsistentPolicy = &inner
+	}
 	return policy
 }
 
-// ociShouldRetry is the SDK's predicate plus a connection the server closed
-// under the request, which the SDK matches only when nothing wraps the error.
-// Such a request may have been received, as with a timeout the SDK retries.
-func ociShouldRetry(r common.OCIOperationResponse) bool {
-	if common.DefaultShouldRetryOperation(r) {
-		return true
+// ociAlsoClosed adds to retry a connection the server closed under the
+// request, which the SDK matches only when nothing wraps the error. Such a
+// request may have been received, as with a timeout the SDK retries.
+func ociAlsoClosed(retry ociPredicate) ociPredicate {
+	return func(r common.OCIOperationResponse) bool {
+		if retry(r) {
+			return true
+		}
+		err := r.Error
+		if err == nil {
+			return false
+		}
+		return errors.Is(err, io.EOF) ||
+			errors.Is(err, io.ErrUnexpectedEOF) ||
+			strings.Contains(err.Error(), "http: server closed idle connection")
 	}
-	err := r.Error
-	if err == nil {
-		return false
+}
+
+// ociOnlyAnswered keeps of retry the failures the server answered with. A
+// request that got no answer may have been carried out, and one sent again
+// leaves a second grant, the first with a URI nobody was given.
+func ociOnlyAnswered(retry ociPredicate) ociPredicate {
+	return func(r common.OCIOperationResponse) bool {
+		_, answered := common.IsServiceError(r.Error)
+		return answered && retry(r)
 	}
-	return errors.Is(err, io.EOF) ||
-		errors.Is(err, io.ErrUnexpectedEOF) ||
-		strings.Contains(err.Error(), "http: server closed idle connection")
 }
 
 const (
@@ -255,6 +283,8 @@ func (p ociTokenProvider) Refreshable() bool {
 	return ok && r.Refreshable()
 }
 
+// The SDK asks for a token with no context, so the fetch of a call that has
+// ended runs on, for under 4s.
 func retryOCIToken[T any](fetch func() (T, error)) (T, error) {
 	start := time.Now()
 	backoff := ociTokenBackoff
@@ -351,8 +381,9 @@ func (s *ociStorage) PresignedURL(ctx context.Context, storagePath string, expir
 	expires := common.SDKTime{Time: time.Now().Add(expiration)}
 
 	resp, err := s.client.CreatePreauthenticatedRequest(ctx, objectstorage.CreatePreauthenticatedRequestRequest{
-		NamespaceName: &s.namespace,
-		BucketName:    &s.conf.Bucket,
+		NamespaceName:   &s.namespace,
+		BucketName:      &s.conf.Bucket,
+		RequestMetadata: common.RequestMetadata{RetryPolicy: &s.grantRetry},
 		CreatePreauthenticatedRequestDetails: objectstorage.CreatePreauthenticatedRequestDetails{
 			Name:        &name,
 			AccessType:  objectstorage.CreatePreauthenticatedRequestDetailsAccessTypeObjectread,
@@ -612,11 +643,17 @@ func (s *ociStorage) ListObjects(ctx context.Context, prefix string) ([]string, 
 	}
 }
 
+// DeleteObjects checks the client once for all its paths, and names every
+// path in its error where there is none, as for any path it does not delete.
 func (s *ociStorage) DeleteObjects(ctx context.Context, storagePaths []string) error {
-	return deleteEach(ctx, storagePaths, func(ctx context.Context, p string) error {
-		if err := s.ready(ctx); err != nil {
-			return err
+	if err := s.ready(ctx); err != nil {
+		failed := make(map[string]error, len(storagePaths))
+		for _, p := range storagePaths {
+			failed[p] = err
 		}
+		return deleteError(failed)
+	}
+	return deleteEach(ctx, storagePaths, func(ctx context.Context, p string) error {
 		_, err := s.client.DeleteObject(ctx, objectstorage.DeleteObjectRequest{
 			NamespaceName: &s.namespace,
 			BucketName:    &s.conf.Bucket,
