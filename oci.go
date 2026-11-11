@@ -205,6 +205,11 @@ func ociRetryPolicy(configured *common.RetryPolicy, change func(ociPredicate) oc
 	if configured != nil {
 		policy = *configured
 	}
+	// A policy of one attempt stays as it is: the SDK asks it about a retry it
+	// will not make, and on a yes reports the body as the failure.
+	if policy.MaximumNumberAttempts == 1 {
+		return policy
+	}
 	policy.ShouldRetryOperation = change(policy.ShouldRetryOperation)
 	if policy.NonEventuallyConsistentPolicy != nil {
 		inner := *policy.NonEventuallyConsistentPolicy
