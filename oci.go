@@ -533,8 +533,7 @@ func (s *ociStorage) uploadParts(ctx context.Context, storagePath string, upload
 		}
 		parts = append(parts, objectstorage.CommitMultipartUploadPartDetails{PartNum: common.Int(num), Etag: resp.ETag})
 
-		n, err = io.ReadFull(body, part)
-		if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+		if n, err = fillPart(body, part); err != nil {
 			return err
 		}
 	}
@@ -548,6 +547,25 @@ func (s *ociStorage) uploadParts(ctx context.Context, storagePath string, upload
 		CommitMultipartUploadDetails: objectstorage.CommitMultipartUploadDetails{PartsToCommit: parts},
 	})
 	return wrapOCIObjectError(err)
+}
+
+// fillPart reads body into part until part is full or body ends with io.EOF.
+// Any other error fails the upload, io.ErrUnexpectedEOF included: it is the
+// body's failure, not its end, and committing what was read would publish a
+// prefix as the whole object.
+func fillPart(body io.Reader, part []byte) (int, error) {
+	n := 0
+	for n < len(part) {
+		m, err := body.Read(part[n:])
+		n += m
+		if err == io.EOF {
+			return n, nil
+		}
+		if err != nil {
+			return n, err
+		}
+	}
+	return n, nil
 }
 
 func (s *ociStorage) GetObject(ctx context.Context, storagePath string) ([]byte, error) {

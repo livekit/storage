@@ -15,12 +15,14 @@
 package storage
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -32,6 +34,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"testing"
+	"testing/iotest"
 	"time"
 
 	"github.com/oracle/oci-go-sdk/v65/common"
@@ -480,5 +483,92 @@ func TestOCIPresignedURLRetriesOnlyAnswered(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, srv.URL+"/p/token/n/ns/b/bucket/o/k", u)
 		require.EqualValues(t, 2, requests.Load())
+	})
+}
+
+// ociMultipartServer answers OCI's multipart upload calls, keeping the bytes
+// of each part and of each committed object.
+type ociMultipartServer struct {
+	mu        sync.Mutex
+	parts     map[int][]byte
+	committed map[string][]byte
+}
+
+func newOCIMultipartServer(t *testing.T) (*ociMultipartServer, string) {
+	m := &ociMultipartServer{parts: map[int][]byte{}, committed: map[string][]byte{}}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		object, upload := strings.CutPrefix(r.URL.Path, "/n/ns/b/bucket/u/")
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/n/ns/b/bucket/u":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"uploadId":"up","namespace":"ns","bucket":"bucket","object":"k"}`)
+		case r.Method == http.MethodPut && upload:
+			num, _ := strconv.Atoi(r.URL.Query().Get("uploadPartNum"))
+			m.parts[num] = body
+			w.Header().Set("ETag", "etag-"+strconv.Itoa(num))
+		case r.Method == http.MethodPost && upload:
+			var whole []byte
+			for num := 1; num <= len(m.parts); num++ {
+				whole = append(whole, m.parts[num]...)
+			}
+			m.committed[object] = whole
+		case r.Method == http.MethodDelete && upload:
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			w.WriteHeader(http.StatusNotImplemented)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return m, srv.URL
+}
+
+// failingAfter yields n bytes of data, then fails with err.
+type failingAfter struct {
+	n   int
+	err error
+}
+
+func (r *failingAfter) Read(p []byte) (int, error) {
+	if r.n == 0 {
+		return 0, r.err
+	}
+	n := min(len(p), r.n)
+	r.n -= n
+	return n, nil
+}
+
+// A body that fails partway through a later part fails the upload, nothing
+// committed, also with an error wrapping io.ErrUnexpectedEOF, as a body
+// streamed from a download cut short does: only io.EOF ends a body.
+func TestOCIMultipartBodyError(t *testing.T) {
+	t.Run("fails, nothing committed", func(t *testing.T) {
+		m, endpoint := newOCIMultipartServer(t)
+		s, err := NewOCI(ociTestConfig(t, endpoint))
+		require.NoError(t, err)
+
+		cut := fmt.Errorf("download base: %w", io.ErrUnexpectedEOF)
+		body := &failingAfter{n: ociUploadPartSize + 1<<20, err: cut}
+		err = s.UploadObject(context.Background(), "k", body, PutOptions{})
+		require.ErrorIs(t, err, io.ErrUnexpectedEOF)
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		require.Empty(t, m.committed)
+	})
+
+	t.Run("a short last part read in pieces commits the whole body", func(t *testing.T) {
+		m, endpoint := newOCIMultipartServer(t)
+		s, err := NewOCI(ociTestConfig(t, endpoint))
+		require.NoError(t, err)
+
+		data := make([]byte, ociUploadPartSize+3<<20)
+		_, _ = rand.Read(data)
+		err = s.UploadObject(context.Background(), "k", iotest.HalfReader(bytes.NewReader(data)), PutOptions{})
+		require.NoError(t, err)
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		require.Equal(t, data, m.committed["k"])
 	})
 }
