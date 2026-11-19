@@ -26,8 +26,8 @@ jobs:
             go.sum
             e2e/go.sum
 
-      - name: Set up gotestfmt
-        run: go install github.com/gotesttools/gotestfmt/v2/cmd/gotestfmt@9eae5abc81d6d08f73268741ef4a8b97f29b60d8 # v2.4.1
+      - name: Set up tparse
+        run: go install github.com/mfridman/tparse@ba2512e7be150bfcbd6f6220d517d3741f8f2f75 # v0.18.0
 
       - name: Download Go modules
         run: go mod download && (cd e2e && go mod download)
@@ -68,9 +68,11 @@ jobs:
       - name: Test
         run: |
           set -euo pipefail
-          go test -race -json -v ./... 2>&1 | gotestfmt
+          # stderr stays out of the pipe: tparse rejects the whole stream if a
+          # non-JSON line follows the first JSON event.
+          go test -race -json ./... | tparse -progress
           (cd objects && go vet ./...)
-          cd e2e && go test -race -json -v -skip '^Test(Floci|MinIO)' ./... 2>&1 | gotestfmt
+          cd e2e && go test -race -json -skip '^Test(Floci|MinIO)' ./... | tparse -progress
 
   # Every backend end to end against its floci emulator (e2e/floci_test.go),
   # and S3 against MinIO (e2e/minio_test.go), whose conditional writes are
@@ -93,8 +95,8 @@ jobs:
             go.sum
             e2e/go.sum
 
-      - name: Set up gotestfmt
-        run: go install github.com/gotesttools/gotestfmt/v2/cmd/gotestfmt@9eae5abc81d6d08f73268741ef4a8b97f29b60d8 # v2.4.1
+      - name: Set up tparse
+        run: go install github.com/mfridman/tparse@ba2512e7be150bfcbd6f6220d517d3741f8f2f75 # v0.18.0
 
       - name: Install MinIO
         if: matrix.test == 'MinIO'
@@ -106,4 +108,6 @@ jobs:
         working-directory: e2e
         run: |
           set -euo pipefail
-          go test -race -json -v -run '^Test${{ matrix.test }}$' ./... 2>&1 | gotestfmt
+          # stderr stays out of the pipe: tparse rejects the whole stream if a
+          # non-JSON line follows the first JSON event.
+          go test -race -json -run '^Test${{ matrix.test }}$' ./... | tparse -progress
