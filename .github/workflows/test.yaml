@@ -27,7 +27,7 @@ jobs:
             e2e/go.sum
 
       - name: Set up tparse
-        run: go install github.com/mfridman/tparse@v0.18.0
+        run: go install github.com/mfridman/tparse@ba2512e7be150bfcbd6f6220d517d3741f8f2f75 # v0.18.0
 
       - name: Download Go modules
         run: go mod download && (cd e2e && go mod download)
@@ -96,7 +96,7 @@ jobs:
             e2e/go.sum
 
       - name: Set up tparse
-        run: go install github.com/mfridman/tparse@v0.18.0
+        run: go install github.com/mfridman/tparse@ba2512e7be150bfcbd6f6220d517d3741f8f2f75 # v0.18.0
 
       - name: Install MinIO
         if: matrix.test == 'MinIO'
