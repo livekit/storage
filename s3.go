@@ -52,12 +52,18 @@ func wrapS3Error(err error) error {
 	if err == nil {
 		return nil
 	}
+	// A request that got no response has a status of 0, which is none.
 	var sc interface{ HTTPStatusCode() int }
-	if errors.As(err, &sc) {
-		return &ErrorWithStatusCode{
+	if errors.As(err, &sc) && sc.HTTPStatusCode() != 0 {
+		wrapped := &ErrorWithStatusCode{
 			Err:        err,
 			StatusCode: sc.HTTPStatusCode(),
 		}
+		var apiErr smithy.APIError
+		if errors.As(err, &apiErr) {
+			wrapped.Code = apiErr.ErrorCode()
+		}
+		return wrapped
 	}
 	return err
 }

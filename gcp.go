@@ -17,6 +17,7 @@ package storage
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -44,20 +45,48 @@ func wrapGCPError(err error) error {
 	if err == nil {
 		return nil
 	}
+	var apiErr *googleapi.Error
+	var code string
+	if errors.As(err, &apiErr) && len(apiErr.Errors) > 0 {
+		code = apiErr.Errors[0].Reason
+	}
 	if errors.Is(err, storage.ErrBucketNotExist) || errors.Is(err, storage.ErrObjectNotExist) {
 		return &ErrorWithStatusCode{
 			Err:        err,
 			StatusCode: http.StatusNotFound,
+			Code:       code,
 		}
 	}
-	var apiErr *googleapi.Error
-	if errors.As(err, &apiErr) {
+	if apiErr != nil {
 		return &ErrorWithStatusCode{
 			Err:        err,
 			StatusCode: apiErr.Code,
+			Code:       code,
+		}
+	}
+	// A token request the credentials' token endpoint refused.
+	var tokenErr *oauth2.RetrieveError
+	if errors.As(err, &tokenErr) && tokenErr.Response != nil {
+		return &ErrorWithStatusCode{
+			Err:        err,
+			StatusCode: tokenErr.Response.StatusCode,
+			Code:       tokenErrorCode(tokenErr),
 		}
 	}
 	return err
+}
+
+// tokenErrorCode is the OAuth error code of a refused token request, such as
+// invalid_grant, which the JWT flow leaves in the response body.
+func tokenErrorCode(err *oauth2.RetrieveError) string {
+	if err.ErrorCode != "" {
+		return err.ErrorCode
+	}
+	var body struct {
+		Error string `json:"error"`
+	}
+	_ = json.Unmarshal(err.Body, &body)
+	return body.Error
 }
 
 type gcpStorage struct {

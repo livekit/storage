@@ -49,6 +49,7 @@ func wrapAzureError(err error) error {
 		return &ErrorWithStatusCode{
 			Err:        err,
 			StatusCode: respErr.StatusCode,
+			Code:       respErr.ErrorCode,
 		}
 	}
 	return err
