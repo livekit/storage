@@ -68,8 +68,9 @@ type GCPConfig struct {
 
 	// BlockPrivateAddresses refuses connections to loopback, private, link-local
 	// and other internal addresses, and ignores proxy environment variables. With
-	// a ProxyConfig, only the proxy's address is checked. Not supported with
-	// GOOGLE_API_USE_CLIENT_CERTIFICATE=true, where creating the client fails.
+	// a ProxyConfig, only the proxy's address is checked, not the destinations it
+	// connects to. Not supported with GOOGLE_API_USE_CLIENT_CERTIFICATE=true,
+	// where creating the client fails.
 	BlockPrivateAddresses bool `yaml:"block_private_addresses,omitempty"`
 }
 
@@ -98,7 +99,8 @@ type OCIConfig struct {
 	Endpoint      string `yaml:"endpoint,omitempty"` // overrides the derived regional endpoint
 
 	// BlockPrivateAddresses refuses connections to loopback, private, link-local
-	// and other internal addresses, and ignores proxy environment variables.
+	// and other internal addresses, and ignores proxy environment variables. It
+	// does not cover the workload identity token request.
 	BlockPrivateAddresses bool `yaml:"block_private_addresses,omitempty"`
 }
 
@@ -126,8 +128,8 @@ type S3Config struct {
 
 	// BlockPrivateAddresses refuses connections to loopback, private, link-local
 	// and other internal addresses, and ignores proxy environment variables. With
-	// a ProxyConfig, only the proxy's address is checked. Credentials from
-	// instance or container metadata are refused too.
+	// a ProxyConfig, only the proxy's address is checked, not the destinations it
+	// connects to. Credentials from instance or container metadata are refused too.
 	BlockPrivateAddresses bool `yaml:"block_private_addresses,omitempty"`
 }
 

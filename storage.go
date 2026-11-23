@@ -322,8 +322,9 @@ func transportWithTimeouts(rt http.RoundTripper, blockPrivate bool) *http.Transp
 }
 
 // blockPrivateAddresses has t dial through a dialer that refuses internal
-// addresses, replacing any dialer it had. The proxy from the environment is
-// dropped, as the dialer would see only the proxy's address.
+// addresses, replacing any dialer it had, which could connect around the check.
+// The proxy from the environment is dropped, as the dialer would see only the
+// proxy's address.
 func blockPrivateAddresses(t *http.Transport) {
 	d := &net.Dialer{}
 	setDialTimeouts(d)

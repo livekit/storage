@@ -30,6 +30,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aliyun/aliyun-oss-go-sdk/oss"
 	"github.com/stretchr/testify/require"
 
 	"github.com/livekit/protocol/utils/netguard"
@@ -225,6 +226,57 @@ func TestBlockPrivateAddressesS3Credentials(t *testing.T) {
 			defer cancel()
 			_, _ = s.ObjectExists(ctx, "path")
 			require.NotZero(t, requests.Load(), "the credential lookup never ran")
+		})
+	}
+}
+
+// With the setting on, AliOSS connects as the SDK's own transport does: over
+// HTTP/1.1, with the SDK's timeouts.
+func TestBlockPrivateAddressesAliOSSTransport(t *testing.T) {
+	var proto atomic.Int32
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		proto.Store(int32(r.ProtoMajor))
+		if strings.HasSuffix(r.URL.Path, "/slow") {
+			select {
+			case <-time.After(3 * time.Second):
+			case <-r.Context().Done():
+			}
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	srv.EnableHTTP2 = true
+	srv.StartTLS()
+	t.Cleanup(srv.Close)
+
+	addr := srv.Listener.Addr().String()
+	blockInternal = func(network, address string, c syscall.RawConn) error {
+		if address == addr {
+			return nil
+		}
+		return netguard.BlockInternal(network, address, c)
+	}
+	t.Cleanup(func() { blockInternal = netguard.BlockInternal })
+
+	for name, extra := range map[string][]oss.ClientOption{
+		"SDK":                     nil,
+		"block_private_addresses": {aliOSSBlockPrivate},
+	} {
+		t.Run(name, func(t *testing.T) {
+			opts := append([]oss.ClientOption{oss.InsecureSkipVerify(true), oss.Timeout(5, 1)}, extra...)
+			client, err := oss.New("https://"+addr, "key", "secret", opts...)
+			require.NoError(t, err)
+			bucket, err := client.Bucket("bucket")
+			require.NoError(t, err)
+
+			proto.Store(0)
+			_, err = bucket.IsObjectExist("fast")
+			require.NoError(t, err)
+			require.EqualValues(t, 1, proto.Load(), "not HTTP/1.1")
+
+			start := time.Now()
+			_, err = bucket.IsObjectExist("slow")
+			require.Error(t, err)
+			require.Less(t, time.Since(start), 3*time.Second, "the SDK's one-second timeout did not apply")
 		})
 	}
 }
