@@ -122,10 +122,12 @@ func (e *DeleteError) Unwrap() []error {
 }
 
 // ErrorWithStatusCode carries the HTTP status a store answered with, under
-// ErrNotFound or ErrExists where those apply; find it with errors.As.
+// ErrNotFound or ErrExists where those apply; find it with errors.As. Code is
+// the store's own name for the error, such as AccessDenied, where it gave one.
 type ErrorWithStatusCode struct {
 	Err        error
 	StatusCode int
+	Code       string
 }
 
 func (e *ErrorWithStatusCode) Error() string {

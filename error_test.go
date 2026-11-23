@@ -24,8 +24,10 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/aliyun/aliyun-oss-go-sdk/oss"
 	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
+	"github.com/aws/smithy-go"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/oauth2"
 	"google.golang.org/api/googleapi"
 )
 
@@ -42,6 +44,13 @@ func requireStatus(t *testing.T, err error, wantStatus int, wantInner error) {
 	require.ErrorAs(t, err, &sce)
 	require.Equal(t, wantStatus, sce.StatusCode)
 	require.ErrorIs(t, sce.Err, wantInner)
+}
+
+func requireCode(t *testing.T, err error, want string) {
+	t.Helper()
+	var sce *ErrorWithStatusCode
+	require.ErrorAs(t, err, &sce)
+	require.Equal(t, want, sce.Code)
 }
 
 type customError struct{ msg string }
@@ -93,6 +102,23 @@ func TestWrapS3Error(t *testing.T) {
 		inner := smithyRespErr(403)
 		wrapped := fmt.Errorf("operation failed: %w", inner)
 		requireStatus(t, wrapS3Error(wrapped), 403, inner)
+		requireCode(t, wrapS3Error(wrapped), "")
+	})
+
+	t.Run("API error code", func(t *testing.T) {
+		inner := smithyRespErr(403)
+		inner.Err = &smithy.GenericAPIError{Code: "AccessDenied", Message: "denied"}
+		requireStatus(t, wrapS3Error(inner), 403, inner)
+		requireCode(t, wrapS3Error(inner), "AccessDenied")
+	})
+
+	// A request that got no response has no status to carry.
+	t.Run("no response", func(t *testing.T) {
+		inner := smithyRespErr(0)
+		got := wrapS3Error(inner)
+		require.Same(t, inner, got)
+		var sce *ErrorWithStatusCode
+		require.False(t, errors.As(got, &sce))
 	})
 
 	t.Run("plain error passes through", func(t *testing.T) {
@@ -131,6 +157,25 @@ func TestWrapGCPError(t *testing.T) {
 		inner := &googleapi.Error{Code: 403, Message: "forbidden"}
 		wrapped := fmt.Errorf("delete failed: %w", inner)
 		requireStatus(t, wrapGCPError(wrapped), 403, inner)
+		requireCode(t, wrapGCPError(wrapped), "")
+	})
+
+	t.Run("googleapi.Error reason", func(t *testing.T) {
+		inner := &googleapi.Error{Code: 403, Message: "denied", Errors: []googleapi.ErrorItem{{Reason: "forbidden", Message: "denied"}}}
+		requireStatus(t, wrapGCPError(inner), 403, inner)
+		requireCode(t, wrapGCPError(inner), "forbidden")
+	})
+
+	// The JWT flow leaves the OAuth error code in the response body.
+	t.Run("refused token request", func(t *testing.T) {
+		inner := &oauth2.RetrieveError{Response: &http.Response{StatusCode: 400}, Body: []byte(`{"error":"invalid_grant"}`)}
+		wrapped := fmt.Errorf("get: %w", inner)
+		requireStatus(t, wrapGCPError(wrapped), 400, inner)
+		requireCode(t, wrapGCPError(wrapped), "invalid_grant")
+
+		inner = &oauth2.RetrieveError{Response: &http.Response{StatusCode: 502}, Body: []byte("bad gateway")}
+		requireStatus(t, wrapGCPError(inner), 502, inner)
+		requireCode(t, wrapGCPError(inner), "")
 	})
 
 	t.Run("plain error passes through", func(t *testing.T) {
@@ -150,6 +195,7 @@ func TestWrapAzureError(t *testing.T) {
 	t.Run("azcore ResponseError", func(t *testing.T) {
 		inner := &azcore.ResponseError{StatusCode: 409, ErrorCode: "BlobAlreadyExists"}
 		requireStatus(t, wrapAzureError(inner), 409, inner)
+		requireCode(t, wrapAzureError(inner), "BlobAlreadyExists")
 	})
 
 	t.Run("wrapped azcore ResponseError", func(t *testing.T) {
@@ -175,6 +221,7 @@ func TestWrapAliOSSError(t *testing.T) {
 	t.Run("ServiceError", func(t *testing.T) {
 		inner := oss.ServiceError{StatusCode: 403, Code: "AccessDenied", Message: "denied"}
 		requireStatus(t, wrapAliOSSError(inner), 403, inner)
+		requireCode(t, wrapAliOSSError(inner), "AccessDenied")
 	})
 
 	t.Run("wrapped ServiceError", func(t *testing.T) {
@@ -219,6 +266,7 @@ func TestWrapOCIError(t *testing.T) {
 	t.Run("ServiceError", func(t *testing.T) {
 		inner := &ociServiceError{status: 403}
 		requireStatus(t, wrapOCIError(inner), 403, inner)
+		requireCode(t, wrapOCIError(inner), "ObjectNotFound")
 	})
 
 	t.Run("wrapped ServiceError", func(t *testing.T) {
