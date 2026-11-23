@@ -38,6 +38,7 @@ import (
 	"golang.org/x/net/http/httpproxy"
 	"golang.org/x/sync/errgroup"
 
+	"github.com/livekit/protocol/utils/netguard"
 	"github.com/livekit/storage/objects"
 )
 
@@ -294,8 +295,8 @@ func unixNano(t time.Time) int64 {
 const maxIdleConnsPerHost = 32
 
 // transportWithTimeouts is a clone of t, or of Go's default transport, with
-// every timeout set.
-func transportWithTimeouts(rt http.RoundTripper) *http.Transport {
+// every timeout set, and with blockPrivateAddresses applied when blockPrivate is set.
+func transportWithTimeouts(rt http.RoundTripper, blockPrivate bool) *http.Transport {
 	// A wrapped transport, such as a tracing one, cannot be cloned, so the
 	// client gets a plain one with Go's defaults instead.
 	t, ok := rt.(*http.Transport)
@@ -313,8 +314,32 @@ func transportWithTimeouts(rt http.RoundTripper) *http.Transport {
 	t.MaxIdleConnsPerHost = max(t.MaxIdleConnsPerHost, maxIdleConnsPerHost)
 	t.TLSHandshakeTimeout = tlsHandshakeTimeout
 	setHTTP2Pings(t)
+	if blockPrivate {
+		blockPrivateAddresses(t)
+	}
 	setIdleTimeout(t)
 	return t
+}
+
+// blockPrivateAddresses has t dial through a dialer that refuses internal
+// addresses, replacing any dialer it had. The proxy from the environment is
+// dropped, as the dialer would see only the proxy's address.
+func blockPrivateAddresses(t *http.Transport) {
+	d := &net.Dialer{}
+	setDialTimeouts(d)
+	setBlockPrivate(d)
+	t.DialContext = d.DialContext
+	t.DialTLSContext = nil
+	t.DialTLS = nil //nolint:staticcheck // either would dial https without d
+	t.Proxy = nil
+}
+
+// blockInternal is the Control of a dialer that refuses internal addresses.
+var blockInternal = netguard.BlockInternal
+
+func setBlockPrivate(d *net.Dialer) {
+	d.Control = blockInternal
+	d.ControlContext = nil
 }
 
 // proxySetter routes a transport through p, or leaves it as it is when p is

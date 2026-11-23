@@ -36,6 +36,8 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/bloberror"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/sas"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/service"
+
+	"github.com/livekit/protocol/utils/netguard"
 )
 
 func wrapAzureError(err error) error {
@@ -75,7 +77,7 @@ func NewAzure(conf *AzureConfig) (Storage, error) {
 		serviceURL: serviceURL,
 		// azcore's own transport has no idle timeout, and keeps fewer idle
 		// connections than an upload sends blocks at once.
-		options: policy.ClientOptions{Transport: &http.Client{Transport: transportWithTimeouts(http.DefaultTransport)}},
+		options: policy.ClientOptions{Transport: azureClient{&http.Client{Transport: transportWithTimeouts(http.DefaultTransport, conf.BlockPrivateAddresses)}}},
 	}
 
 	var err error
@@ -89,6 +91,25 @@ func NewAzure(conf *AzureConfig) (Storage, error) {
 	s.client, err = azblob.NewClientWithSharedKeyCredential(serviceURL, s.cred, &azblob.ClientOptions{ClientOptions: s.options})
 	return s, err
 }
+
+// azureClient has azcore's retry policy give up on a refused address, which
+// would be refused again.
+type azureClient struct{ *http.Client }
+
+func (c azureClient) Do(r *http.Request) (*http.Response, error) {
+	resp, err := c.Client.Do(r)
+	if errors.Is(err, netguard.ErrBlockedAddress) {
+		err = nonRetriable{err}
+	}
+	return resp, err
+}
+
+// nonRetriable satisfies azcore's errorinfo.NonRetriable.
+type nonRetriable struct{ error }
+
+func (nonRetriable) NonRetriable() {}
+
+func (e nonRetriable) Unwrap() error { return e.error }
 
 func azureServiceURL(conf *AzureConfig) string {
 	if conf.Endpoint != "" {

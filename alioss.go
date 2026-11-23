@@ -31,6 +31,8 @@ import (
 	"time"
 
 	"github.com/aliyun/aliyun-oss-go-sdk/oss"
+
+	"github.com/livekit/protocol/utils/netguard"
 )
 
 func wrapAliOSSError(err error) error {
@@ -60,7 +62,11 @@ type aliOSSStorage struct {
 }
 
 func NewAliOSS(conf *AliOSSConfig) (Storage, error) {
-	client, err := oss.New(conf.Endpoint, conf.AccessKey, conf.Secret)
+	var opts []oss.ClientOption
+	if conf.BlockPrivateAddresses {
+		opts = append(opts, oss.HTTPClient(&http.Client{Transport: transportWithTimeouts(nil, true)}))
+	}
+	client, err := oss.New(conf.Endpoint, conf.AccessKey, conf.Secret, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -284,6 +290,9 @@ func aliOSSRetry(ctx context.Context, call func() error) error {
 // a 5xx, or a connection that broke. A 4xx, as for a denied or bad request,
 // would fail again.
 func aliOSSRetryable(err error) bool {
+	if errors.Is(err, netguard.ErrBlockedAddress) {
+		return false
+	}
 	var svcErr oss.ServiceError
 	if errors.As(err, &svcErr) {
 		return svcErr.StatusCode >= 500 || svcErr.StatusCode == http.StatusTooManyRequests
