@@ -42,6 +42,7 @@ func wrapAliOSSError(err error) error {
 		return &ErrorWithStatusCode{
 			Err:        err,
 			StatusCode: svcErr.StatusCode,
+			Code:       svcErr.Code,
 		}
 	}
 	var unexpectedErr oss.UnexpectedStatusCodeError

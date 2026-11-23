@@ -412,6 +412,7 @@ func wrapOCIError(err error) error {
 		return &ErrorWithStatusCode{
 			Err:        err,
 			StatusCode: se.GetHTTPStatusCode(),
+			Code:       se.GetCode(),
 		}
 	}
 	return err

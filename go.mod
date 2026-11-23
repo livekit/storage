@@ -16,7 +16,7 @@ require (
 	github.com/aws/smithy-go v1.28.1
 	github.com/googleapis/gax-go/v2 v2.26.2
 	github.com/livekit/protocol v1.52.1
-	github.com/livekit/storage/objects v0.1.0
+	github.com/livekit/storage/objects v0.2.0
 	github.com/oracle/oci-go-sdk/v65 v65.126.1
 	github.com/stretchr/testify v1.12.1
 	golang.org/x/net v0.59.0
