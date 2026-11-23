@@ -17,7 +17,6 @@ package storage
 import (
 	"bytes"
 	"context"
-	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -88,8 +87,7 @@ func NewAliOSS(conf *AliOSSConfig) (Storage, error) {
 // from the same config, with a dialer that refuses internal addresses.
 func aliOSSBlockPrivate(c *oss.Client) {
 	timeouts := c.Config.HTTPTimeout
-	conns := c.Config.HTTPMaxConns
-	t := &http.Transport{
+	c.HTTPClient = &http.Client{Transport: &http.Transport{
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			d := &net.Dialer{Timeout: timeouts.ConnectTimeout, KeepAlive: 30 * time.Second}
 			setBlockPrivate(d)
@@ -97,45 +95,12 @@ func aliOSSBlockPrivate(c *oss.Client) {
 			if err != nil {
 				return nil, err
 			}
-			return newAliOSSConn(conn, timeouts.ReadWriteTimeout, timeouts.LongTimeout), nil
+			return &idleConn{Conn: conn, timeout: timeouts.ReadWriteTimeout}, nil
 		},
-		MaxIdleConns:          conns.MaxIdleConns,
-		MaxIdleConnsPerHost:   conns.MaxIdleConnsPerHost,
-		MaxConnsPerHost:       conns.MaxConnsPerHost,
-		IdleConnTimeout:       timeouts.IdleConnTimeout,
-		ResponseHeaderTimeout: timeouts.HeaderTimeout,
-	}
-	if c.Config.InsecureSkipVerify {
-		t.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
-	}
-	c.HTTPClient = &http.Client{Transport: t}
-}
-
-// aliOSSConn applies the SDK's timeouts: each read or write gets timeout, and
-// between them a read waits up to longTimeout.
-type aliOSSConn struct {
-	net.Conn
-	timeout     time.Duration
-	longTimeout time.Duration
-}
-
-func newAliOSSConn(conn net.Conn, timeout, longTimeout time.Duration) *aliOSSConn {
-	_ = conn.SetReadDeadline(time.Now().Add(longTimeout))
-	return &aliOSSConn{Conn: conn, timeout: timeout, longTimeout: longTimeout}
-}
-
-func (c *aliOSSConn) Read(b []byte) (int, error) {
-	_ = c.SetReadDeadline(time.Now().Add(c.timeout))
-	n, err := c.Conn.Read(b)
-	_ = c.SetReadDeadline(time.Now().Add(c.longTimeout))
-	return n, err
-}
-
-func (c *aliOSSConn) Write(b []byte) (int, error) {
-	_ = c.SetWriteDeadline(time.Now().Add(c.timeout))
-	n, err := c.Conn.Write(b)
-	_ = c.SetReadDeadline(time.Now().Add(c.longTimeout))
-	return n, err
+		MaxIdleConns:        c.Config.HTTPMaxConns.MaxIdleConns,
+		MaxIdleConnsPerHost: c.Config.HTTPMaxConns.MaxIdleConnsPerHost,
+		IdleConnTimeout:     timeouts.IdleConnTimeout,
+	}}
 }
 
 func (s *aliOSSStorage) UploadFile(ctx context.Context, storagePath, filepath string, opts PutOptions) (string, int64, error) {

@@ -18,10 +18,12 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -236,11 +238,22 @@ func TestBlockPrivateAddressesAliOSSTransport(t *testing.T) {
 	var proto atomic.Int32
 	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		proto.Store(int32(r.ProtoMajor))
-		if strings.HasSuffix(r.URL.Path, "/slow") {
+		wait := func() {
 			select {
 			case <-time.After(3 * time.Second):
 			case <-r.Context().Done():
 			}
+		}
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/slow"):
+			wait()
+		case strings.HasSuffix(r.URL.Path, "/stall"):
+			w.Header().Set("Content-Length", "2")
+			_, _ = w.Write([]byte("a"))
+			w.(http.Flusher).Flush()
+			wait()
+			_, _ = w.Write([]byte("b"))
+			return
 		}
 		w.WriteHeader(http.StatusNotFound)
 	}))
@@ -257,13 +270,19 @@ func TestBlockPrivateAddressesAliOSSTransport(t *testing.T) {
 	}
 	t.Cleanup(func() { blockInternal = netguard.BlockInternal })
 
-	for name, extra := range map[string][]oss.ClientOption{
-		"SDK":                     nil,
-		"block_private_addresses": {aliOSSBlockPrivate},
+	roots := x509.NewCertPool()
+	roots.AddCert(srv.Certificate())
+	blocking := func(c *oss.Client) {
+		aliOSSBlockPrivate(c)
+		c.HTTPClient.Transport.(*http.Transport).TLSClientConfig = &tls.Config{RootCAs: roots}
+	}
+
+	for name, extra := range map[string]oss.ClientOption{
+		"SDK":                     oss.InsecureSkipVerify(true),
+		"block_private_addresses": blocking,
 	} {
 		t.Run(name, func(t *testing.T) {
-			opts := append([]oss.ClientOption{oss.InsecureSkipVerify(true), oss.Timeout(5, 1)}, extra...)
-			client, err := oss.New("https://"+addr, "key", "secret", opts...)
+			client, err := oss.New("https://"+addr, "key", "secret", oss.Timeout(5, 1), extra)
 			require.NoError(t, err)
 			bucket, err := client.Bucket("bucket")
 			require.NoError(t, err)
@@ -276,7 +295,15 @@ func TestBlockPrivateAddressesAliOSSTransport(t *testing.T) {
 			start := time.Now()
 			_, err = bucket.IsObjectExist("slow")
 			require.Error(t, err)
-			require.Less(t, time.Since(start), 3*time.Second, "the SDK's one-second timeout did not apply")
+			require.Less(t, time.Since(start), 3*time.Second, "the SDK's one-second timeout did not apply to the response headers")
+
+			body, err := bucket.GetObject("stall")
+			require.NoError(t, err)
+			defer body.Close()
+			start = time.Now()
+			_, err = io.ReadAll(body)
+			require.Error(t, err)
+			require.Less(t, time.Since(start), 3*time.Second, "the SDK's one-second timeout did not apply to the body")
 		})
 	}
 }
