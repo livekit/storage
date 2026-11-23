@@ -106,11 +106,14 @@ func NewGCP(conf *GCPConfig) (Storage, error) {
 	// An http:// endpoint is an emulator, which takes no credentials; any other
 	// endpoint, such as Private Service Connect, keeps them.
 	emulator := strings.HasPrefix(conf.Endpoint, "http://")
+	if os.Getenv("GOOGLE_API_USE_CLIENT_CERTIFICATE") == "true" && conf.BlockPrivateAddresses {
+		return nil, errors.New("block_private_addresses needs this package's transport, which GOOGLE_API_USE_CLIENT_CERTIFICATE replaces")
+	}
 	setProxy, err := proxySetter(conf.ProxyConfig)
 	if err != nil {
 		return nil, err
 	}
-	t := transportWithTimeouts(http.DefaultTransport)
+	t := transportWithTimeouts(http.DefaultTransport, conf.BlockPrivateAddresses)
 	setProxy(t)
 
 	var opts []option.ClientOption

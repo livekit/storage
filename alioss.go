@@ -31,6 +31,8 @@ import (
 	"time"
 
 	"github.com/aliyun/aliyun-oss-go-sdk/oss"
+
+	"github.com/livekit/protocol/utils/netguard"
 )
 
 func wrapAliOSSError(err error) error {
@@ -61,7 +63,11 @@ type aliOSSStorage struct {
 }
 
 func NewAliOSS(conf *AliOSSConfig) (Storage, error) {
-	client, err := oss.New(conf.Endpoint, conf.AccessKey, conf.Secret)
+	var opts []oss.ClientOption
+	if conf.BlockPrivateAddresses {
+		opts = append(opts, aliOSSBlockPrivate)
+	}
+	client, err := oss.New(conf.Endpoint, conf.AccessKey, conf.Secret, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -75,6 +81,26 @@ func NewAliOSS(conf *AliOSSConfig) (Storage, error) {
 		conf:   conf,
 		bucket: bucket,
 	}, nil
+}
+
+// aliOSSBlockPrivate gives the client the transport the SDK builds for itself,
+// from the same config, with a dialer that refuses internal addresses.
+func aliOSSBlockPrivate(c *oss.Client) {
+	timeouts := c.Config.HTTPTimeout
+	c.HTTPClient = &http.Client{Transport: &http.Transport{
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			d := &net.Dialer{Timeout: timeouts.ConnectTimeout, KeepAlive: 30 * time.Second}
+			setBlockPrivate(d)
+			conn, err := d.DialContext(ctx, network, addr)
+			if err != nil {
+				return nil, err
+			}
+			return &idleConn{Conn: conn, timeout: timeouts.ReadWriteTimeout}, nil
+		},
+		MaxIdleConns:        c.Config.HTTPMaxConns.MaxIdleConns,
+		MaxIdleConnsPerHost: c.Config.HTTPMaxConns.MaxIdleConnsPerHost,
+		IdleConnTimeout:     timeouts.IdleConnTimeout,
+	}}
 }
 
 func (s *aliOSSStorage) UploadFile(ctx context.Context, storagePath, filepath string, opts PutOptions) (string, int64, error) {
@@ -285,6 +311,9 @@ func aliOSSRetry(ctx context.Context, call func() error) error {
 // a 5xx, or a connection that broke. A 4xx, as for a denied or bad request,
 // would fail again.
 func aliOSSRetryable(err error) bool {
+	if errors.Is(err, netguard.ErrBlockedAddress) {
+		return false
+	}
 	var svcErr oss.ServiceError
 	if errors.As(err, &svcErr) {
 		return svcErr.StatusCode >= 500 || svcErr.StatusCode == http.StatusTooManyRequests

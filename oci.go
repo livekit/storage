@@ -142,14 +142,18 @@ func (s *ociStorage) build() error {
 				if err != nil {
 					return nil, err
 				}
-				return transportWithTimeouts(t), nil
+				return transportWithTimeouts(t, conf.BlockPrivateAddresses), nil
 			}
+		} else if conf.BlockPrivateAddresses {
+			return fmt.Errorf("block_private_addresses: unexpected OCI transport %T", hc.Transport)
 		}
 		c := &http.Client{Transport: hc.Transport, CheckRedirect: hc.CheckRedirect, Jar: hc.Jar}
 		if os.Getenv(common.CustomClientTimeoutEnvVar) != "" {
 			c.Timeout = hc.Timeout
 		}
 		client.HTTPClient = c
+	} else if conf.BlockPrivateAddresses {
+		return fmt.Errorf("block_private_addresses: unexpected OCI client %T", client.HTTPClient)
 	}
 	// The SDK has set the policy the environment or common.GlobalRetry asks for.
 	configured := client.Configuration.RetryPolicy

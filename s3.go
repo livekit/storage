@@ -36,6 +36,7 @@ import (
 	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/credentials/endpointcreds"
 	"github.com/aws/aws-sdk-go-v2/credentials/stscreds"
 	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -43,6 +44,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/sts"
 	"github.com/aws/smithy-go"
 	"github.com/aws/smithy-go/middleware"
+
+	"github.com/livekit/protocol/utils/netguard"
 )
 
 func wrapS3Error(err error) error {
@@ -134,6 +137,7 @@ func getConf(conf *S3Config, cp aws.CredentialsProvider) (*aws.Config, error) {
 				// on retries is per client: one outage would use it up and fail
 				// every call at once.
 				o.RateLimiter = ratelimit.None
+				o.Retryables = append([]retry.IsErrorRetryable{retry.IsErrorRetryableFunc(blockedNotRetryable)}, o.Retryables...)
 				o.Retryables = append(o.Retryables, retry.RetryableHTTPStatusCode{
 					Codes: map[int]struct{}{
 						http.StatusConflict:        {},
@@ -152,10 +156,20 @@ func getConf(conf *S3Config, cp aws.CredentialsProvider) (*aws.Config, error) {
 		// The idle timeout goes on in newS3Client: a defaults mode
 		// (AWS_DEFAULTS_MODE) replaces the dialer when a client is made. The
 		// SDK's read timeout is off, as the idle timeout bounds reads and writes.
-		o.HTTPClient = awshttp.NewBuildableClient().
+		client := awshttp.NewBuildableClient().
 			WithDialerOptions(setDialTimeouts).
-			WithTransportOptions(func(t *http.Transport) { t.TLSHandshakeTimeout = tlsHandshakeTimeout }, setHTTP2Pings, setProxy).
-			WithReadTimeout(0)
+			WithTransportOptions(func(t *http.Transport) { t.TLSHandshakeTimeout = tlsHandshakeTimeout }, setHTTP2Pings)
+		if conf.BlockPrivateAddresses {
+			// The dialer is copied, Control and all, when a defaults mode sets its timeout.
+			client = client.
+				WithDialerOptions(setBlockPrivate).
+				WithTransportOptions(func(t *http.Transport) { t.Proxy = nil })
+		}
+		o.HTTPClient = client.WithTransportOptions(setProxy).WithReadTimeout(0)
+		if conf.BlockPrivateAddresses {
+			// Container credentials (ECS, EKS Pod Identity) otherwise use a client of their own.
+			o.EndpointCredentialOptions = func(e *endpointcreds.Options) { e.HTTPClient = o.HTTPClient }
+		}
 
 		return nil
 	}
@@ -170,6 +184,13 @@ func getConf(conf *S3Config, cp aws.CredentialsProvider) (*aws.Config, error) {
 	}
 
 	return &awsConf, nil
+}
+
+func blockedNotRetryable(err error) aws.Ternary {
+	if errors.Is(err, netguard.ErrBlockedAddress) {
+		return aws.FalseTernary
+	}
+	return aws.UnknownTernary
 }
 
 func updateRegion(awsConf *aws.Config, bucket string) error {

@@ -125,7 +125,7 @@ func h2Server(t *testing.T, h http.Handler, takeover func(*http.Server, *tls.Con
 	}
 	srv.StartTLS()
 	t.Cleanup(srv.Close)
-	client := &http.Client{Transport: transportWithTimeouts(srv.Client().Transport)}
+	client := &http.Client{Transport: transportWithTimeouts(srv.Client().Transport, false)}
 	return srv, client
 }
 
@@ -135,7 +135,7 @@ func TestIdleTimeout(t *testing.T) {
 	saved := idleTimeout
 	idleTimeout = time.Second
 	t.Cleanup(func() { idleTimeout = saved })
-	client := &http.Client{Transport: transportWithTimeouts(nil)}
+	client := &http.Client{Transport: transportWithTimeouts(nil, false)}
 
 	t.Run("slow upload", func(t *testing.T) {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

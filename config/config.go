@@ -32,6 +32,10 @@ type AliOSSConfig struct {
 	Secret    string `yaml:"secret,omitempty"`
 	Endpoint  string `yaml:"endpoint,omitempty"`
 	Bucket    string `yaml:"bucket,omitempty"`
+
+	// BlockPrivateAddresses refuses connections to loopback, private, link-local
+	// and other internal addresses, and ignores proxy environment variables.
+	BlockPrivateAddresses bool `yaml:"block_private_addresses,omitempty"`
 }
 
 func (*AliOSSConfig) storageConfig() {}
@@ -44,6 +48,10 @@ type AzureConfig struct {
 	// Endpoint replaces the service URL https://<account>.blob.core.windows.net/,
 	// e.g. an emulator's http://localhost:4577/<account>/.
 	Endpoint string `yaml:"endpoint,omitempty"`
+
+	// BlockPrivateAddresses refuses connections to loopback, private, link-local
+	// and other internal addresses, and ignores proxy environment variables.
+	BlockPrivateAddresses bool `yaml:"block_private_addresses,omitempty"`
 }
 
 func (*AzureConfig) storageConfig() {}
@@ -57,6 +65,13 @@ type GCPConfig struct {
 	// http://localhost:4588, and gets no credentials; CredentialsJSON still
 	// signs URLs.
 	Endpoint string `yaml:"endpoint,omitempty"`
+
+	// BlockPrivateAddresses refuses connections to loopback, private, link-local
+	// and other internal addresses, and ignores proxy environment variables. With
+	// a ProxyConfig, only the proxy's address is checked, not the destinations it
+	// connects to. Not supported with GOOGLE_API_USE_CLIENT_CERTIFICATE=true,
+	// where creating the client fails.
+	BlockPrivateAddresses bool `yaml:"block_private_addresses,omitempty"`
 }
 
 func (*GCPConfig) storageConfig() {}
@@ -82,6 +97,11 @@ type OCIConfig struct {
 	CompartmentID string `yaml:"compartment_id,omitempty"` // only used for cross-tenancy namespace lookup
 	Bucket        string `yaml:"bucket,omitempty"`
 	Endpoint      string `yaml:"endpoint,omitempty"` // overrides the derived regional endpoint
+
+	// BlockPrivateAddresses refuses connections to loopback, private, link-local
+	// and other internal addresses, and ignores proxy environment variables. It
+	// does not cover the workload identity token request.
+	BlockPrivateAddresses bool `yaml:"block_private_addresses,omitempty"`
 }
 
 func (*OCIConfig) storageConfig() {}
@@ -105,6 +125,12 @@ type S3Config struct {
 	Metadata           map[string]string `yaml:"metadata,omitempty"`
 	Tagging            string            `yaml:"tagging,omitempty"`
 	ContentDisposition string            `yaml:"content_disposition,omitempty"`
+
+	// BlockPrivateAddresses refuses connections to loopback, private, link-local
+	// and other internal addresses, and ignores proxy environment variables. With
+	// a ProxyConfig, only the proxy's address is checked, not the destinations it
+	// connects to. Credentials from instance or container metadata are refused too.
+	BlockPrivateAddresses bool `yaml:"block_private_addresses,omitempty"`
 }
 
 func (*S3Config) storageConfig() {}
